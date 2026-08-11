@@ -4,6 +4,12 @@
 #include "esp_adc/adc_continuous.h"
 #include "hal/adc_types.h"
 #include <math.h>
+#include <Wire.h>
+#include <Adafruit_Sensor.h>
+#include <Adafruit_BME280.h>
+
+Adafruit_BME280 bme;
+
 
 // ==============================================================================
 // I. GLOBAL HARDWARE & MASSIVE MEMORY ALLOCATION
@@ -11,45 +17,57 @@
 const int TX_TRIG[5] = {4, 14, 17, 19, 25};
 const int TX_ECHO[5] = {13, 16, 18, 23, 26};
 
-// --- SPATIAL GEOMETRY (In Meters) ---
 const float TX_X[5] = {-0.0084, -0.0042, 0.0, 0.0042, 0.0084};
 const float RX_X[5] = {-0.025, -0.009, 0.002, 0.013, 0.025}; 
 const float RX_Z_OFFSET = 0.01517; 
 const float TARGET_Y = 0.54;       
-const float CALIBRATION_SPEED_OF_SOUND = 343.0; // The temp of the room DURING calibration
+volatile float live_speed_of_sound = 343.0;
 const float SAMPLE_RATE = 500000.0; 
 
-// --- MAXIMUM RAM EXPANSION ---
-// --- MAXIMUM SAFE RAM EXPANSION (1200 Samples = 4.1 Meters Range) ---
 const int BUFFER_LENGTH = 1200;
 float rx_buffers[5][BUFFER_LENGTH] = {0};
 float aligned_buffers[5][BUFFER_LENGTH] = {0}; 
 float accumulation_buffers[5][BUFFER_LENGTH] = {0}; 
 
+// Your Mathematical Baselines
 const float CALIB_RX_HW_ERROR[5] = {0.8878, -2.3402, 0.0011, 0.2319, -2.7091};
-const float CALIB_TX_HW_ERROR[5] = {-0.0942, -0.0233, 0.0014, -0.0237, -0.0949};
 const float CALIB_RX_GAIN[5] = {0.8324, 1.0094, 1.0000, 1.0918, 0.9189};
 
-// DMA memory sized exactly for 1200 samples
+// THE MUTABLE ARRAY: Starts with your baseline, but will be overwritten by the Brute-Force Tuner
+float dynamic_tx_error[5] = {3.0758, -0.9833, 0.0014, -0.0937, 4.0451};
+
 adc_continuous_handle_t adc_handle = NULL;
 const uint32_t DMA_FLAT_BUFFER_SIZE = 12000;
 uint8_t dma_flat_buffer[DMA_FLAT_BUFFER_SIZE] = {0};
 
 const adc_channel_t RX_CHANNELS[5] = {ADC_CHANNEL_4, ADC_CHANNEL_5, ADC_CHANNEL_7, ADC_CHANNEL_0, ADC_CHANNEL_3};
 
-// --- PERMANENT HARDWARE CONSTANTS ---
-float rx_offsets[5] = {0}; 
-float tx_offsets[5] = {0};
-float rx_gain_multipliers[5] = {1.0, 1.0, 1.0, 1.0, 1.0}; // The Integral Fix
-
-enum SystemState { RAW_DIAGNOSTIC, CALIBRATE_RX, CALIBRATE_TX, PRINT_CALIB_FILE, VERIFY_FIRE, MUSIC_DOA };
-SystemState currentState = CALIBRATE_RX;
-int tx_calib_index = 0;
+// We skip Phase 1 and 2, and boot directly into the Brute Force Auto-Tuner
+enum SystemState { EMPIRICAL_AUTO_TUNE, GAIN_COMPARISON, MUSIC_DOA };
+SystemState currentState = EMPIRICAL_AUTO_TUNE;
+int tune_tx_idx = 0;
 
 // ==============================================================================
 // II. SIGNAL PROCESSING MATHEMATICS
 // ==============================================================================
-
+// Thermodynamics (Decoupled Background Task on Core 0)
+void bme280_task(void *pvParameters) {
+    Wire.begin(21, 22); // Initialize I2C on SDA=21, SCL=22
+    
+    if (!bme.begin(0x76)) { // 0x76 or 0x77 is the standard BME280 I2C address
+        Serial.println("BME280 Sensor missing! Defaulting to 343.0 m/s");
+        vTaskDelete(NULL); // Terminate task if hardware is missing
+    }
+    
+    while (true) {
+        float tempC = bme.readTemperature();
+        // Calculate live speed of sound down to the decimal
+        live_speed_of_sound = 331.3f + (0.606f * tempC);
+        
+        // Pause this task for exactly 1000 milliseconds (1 Hz tick rate)
+        vTaskDelay(1000 / portTICK_PERIOD_MS); 
+    }
+}
 void removeDCBias() {
     for(int i = 0; i < 5; i++) {
         float sum = 0;
@@ -59,67 +77,27 @@ void removeDCBias() {
     }
 }
 
-// Integral Area Calculation (Gain Matching)
-void calculateGainMultipliers(int start_idx, int end_idx) {
-    float area[5] = {0};
-    
-    // Calculate the absolute integral area for all 5 channels
-    for(int i = 0; i < 5; i++) {
-        for(int j = start_idx; j <= end_idx; j++) {
-            area[i] += abs(rx_buffers[i][j]);
-        }
-    }
-    
-    // RX3 (Index 2) is the master volume
-    for(int i = 0; i < 5; i++) {
-        if(area[i] > 0.0f) {
-            rx_gain_multipliers[i] = area[2] / area[i];
-        }
-    }
-}
-
-float calculateCrossCorrelationOffset(int master_ch, int target_ch, int start_idx, int end_idx) {
-    int best_shift = 0;
-    float max_dot_product = -1000000.0f; 
-    float dot_curve[21] = {0}; 
-
-    for (int shift = -10; shift <= 10; shift++) {
-        float dot_product = 0;
-        for (int j = start_idx; j <= end_idx; j++) {
-            int shifted_idx = j + shift;
-            if (shifted_idx >= 0 && shifted_idx < BUFFER_LENGTH) {
-                dot_product += rx_buffers[master_ch][j] * rx_buffers[target_ch][shifted_idx];
-            }
-        }
-        dot_curve[shift + 10] = dot_product; 
-        if (dot_product > max_dot_product) { max_dot_product = dot_product; best_shift = shift; }
-    }
-    
-    if (best_shift == -10 || best_shift == 10) return (float)best_shift;
-    
-    float y_left = dot_curve[(best_shift - 1) + 10];
-    float y_center = dot_curve[best_shift + 10];
-    float y_right = dot_curve[(best_shift + 1) + 10];
-    float denominator = (y_left - 2.0f * y_center + y_right);
-    if (denominator == 0.0f) return (float)best_shift;
-    
-    return (float)best_shift + ((y_left - y_right) / (2.0f * denominator));
-}
-
-// Applies Hardware Phase and Hardware Gain corrections
 void applyPhaseCorrection() {
     for(int i = 0; i < 5; i++) {
-        int discrete_shift = round(rx_offsets[i]); 
+        int discrete_shift = round(CALIB_RX_HW_ERROR[i]); 
         for(int j = 0; j < BUFFER_LENGTH; j++) aligned_buffers[i][j] = 0.0f; 
-        
         for(int j = 0; j < BUFFER_LENGTH; j++) {
             int new_index = j - discrete_shift; 
             if(new_index >= 0 && new_index < BUFFER_LENGTH) {
-                // Apply the exact wave data MULTIPLIED by the integral gain fixer
-                aligned_buffers[i][new_index] = rx_buffers[i][j] * rx_gain_multipliers[i];
+                aligned_buffers[i][new_index] = rx_buffers[i][j] * CALIB_RX_GAIN[i];
             }
         }
     }
+}
+
+// Measures the pure acoustic energy bouncing off the cylinder into the center microphone
+float getCenterIntegral() {
+    float area = 0;
+    // Window locked strictly onto your 54cm target echo
+    for(int j = 200; j < 300; j++) {
+        area += abs(rx_buffers[2][j]);
+    }
+    return area;
 }
 
 // ==============================================================================
@@ -148,7 +126,6 @@ void initHardwareDMA() {
 void recordAcousticEchoes() {
     ESP_ERROR_CHECK(adc_continuous_start(adc_handle));
     uint32_t total_bytes_read = 0;
-    
     while (total_bytes_read < DMA_FLAT_BUFFER_SIZE) {
         uint32_t bytes_chunk = 0;
         if (adc_continuous_read(adc_handle, dma_flat_buffer + total_bytes_read, DMA_FLAT_BUFFER_SIZE - total_bytes_read, &bytes_chunk, ADC_MAX_DELAY) == ESP_OK) {
@@ -161,7 +138,6 @@ void recordAcousticEchoes() {
     for (int i = 0; i < DMA_FLAT_BUFFER_SIZE; i += SOC_ADC_DIGI_RESULT_BYTES) {
         adc_digi_output_data_t *p = (adc_digi_output_data_t*)&dma_flat_buffer[i];
         float volt = (float)p->type1.data / 4095.0f;
-
         if (p->type1.channel == ADC_CHANNEL_4 && rx_indices[0] < BUFFER_LENGTH) rx_buffers[0][rx_indices[0]++] = volt;
         else if (p->type1.channel == ADC_CHANNEL_5 && rx_indices[1] < BUFFER_LENGTH) rx_buffers[1][rx_indices[1]++] = volt;
         else if (p->type1.channel == ADC_CHANNEL_7 && rx_indices[2] < BUFFER_LENGTH) rx_buffers[2][rx_indices[2]++] = volt;
@@ -186,36 +162,26 @@ void IRAM_ATTR fireSingleTX(int tx_index) {
     portENABLE_INTERRUPTS();
 }
 
-// ==============================================================================
-// PERFECT 0-DEGREE BROADSIDE BEAMFORMING
-// ==============================================================================
 void IRAM_ATTR fireZeroDegreeBeam() {
-    // 1. Find the Slowest Transmitter (Maximum positive hardware error)
-    float max_err = CALIB_TX_HW_ERROR[0];
+    float max_err = dynamic_tx_error[0];
     for(int i = 1; i < 5; i++) {
-        if(CALIB_TX_HW_ERROR[i] > max_err) {
-            max_err = CALIB_TX_HW_ERROR[i];
-        }
+        if(dynamic_tx_error[i] > max_err) max_err = dynamic_tx_error[i];
     }
 
-    // 2. Calculate the required "Wait Time" for the faster transmitters
     uint32_t start_delays[5];
     for(int i = 0; i < 5; i++) {
-        float index_diff = max_err - CALIB_TX_HW_ERROR[i];
-        // 1 index = 2.0us = 480 CPU cycles (at 240MHz)
+        float index_diff = max_err - dynamic_tx_error[i];
         start_delays[i] = (uint32_t)(index_diff * 480.0f); 
     }
 
-    // 3. Define the acoustic burst parameters
-    uint32_t half_period = 3000; // 12.5us HIGH (at 240MHz)
-    uint32_t full_period = 6000; // 25.0us FULL CYCLE (at 240MHz)
+    uint32_t half_period = 3000; 
+    uint32_t full_period = 6000; 
     
-    // 4. Pre-calculate the exact CPU cycle timeline for all 5 pins (16 transitions total: 8 HIGH, 8 LOW)
     uint32_t transitions[5][16];
     for(int i = 0; i < 5; i++) {
         for(int p = 0; p < 8; p++) {
-            transitions[i][p*2]     = start_delays[i] + (p * full_period);               // Time to turn HIGH
-            transitions[i][p*2 + 1] = start_delays[i] + (p * full_period) + half_period; // Time to turn LOW
+            transitions[i][p*2]     = start_delays[i] + (p * full_period);               
+            transitions[i][p*2 + 1] = start_delays[i] + (p * full_period) + half_period; 
         }
     }
 
@@ -223,58 +189,68 @@ void IRAM_ATTR fireZeroDegreeBeam() {
     bool active = true;
 
     portDISABLE_INTERRUPTS(); 
-    uint32_t start_time = xthal_get_ccount(); // Start the master CPU stopwatch
+    uint32_t start_time = xthal_get_ccount(); 
 
-    // 5. The Execution Matrix (Nanosecond Precision Spin-Lock)
     while(active) {
         uint32_t current_time = xthal_get_ccount() - start_time;
         active = false;
-
         for(int i = 0; i < 5; i++) {
             if(state_index[i] < 16) {
-                active = true; // Keep the loop running until all 16 transitions for this pin are done
-                
-                // If the master stopwatch has reached this pin's scheduled transition time
+                active = true; 
                 if(current_time >= transitions[i][state_index[i]]) {
                     if(state_index[i] % 2 == 0) {
-                        // POSITIVE SWING (Push-Pull)
                         REG_WRITE(GPIO_OUT_W1TS_REG, (1 << TX_TRIG[i]));
                         REG_WRITE(GPIO_OUT_W1TC_REG, (1 << TX_ECHO[i]));
                     } else {
-                        // NEGATIVE SWING (Push-Pull)
                         REG_WRITE(GPIO_OUT_W1TC_REG, (1 << TX_TRIG[i]));
                         REG_WRITE(GPIO_OUT_W1TS_REG, (1 << TX_ECHO[i]));
                     }
-                    state_index[i]++; // Move to the next scheduled event for this pin
+                    state_index[i]++; 
                 }
             }
         }
     }
 
-    // 6. INSTANT BRAKE (Violently ground all crystals to stop ringing)
     for(int i = 0; i < 5; i++) {
         REG_WRITE(GPIO_OUT_W1TC_REG, (1 << TX_TRIG[i]));
         REG_WRITE(GPIO_OUT_W1TC_REG, (1 << TX_ECHO[i]));
     }
-
-    esp_rom_delay_us(800); // Hardware range gate
+    esp_rom_delay_us(800); 
     portENABLE_INTERRUPTS();
 }
 
-void fireAndAverage(int tx_index, int num_shots) {
+// Averages 100 shots of the AESA BEAM to perfectly measure Constructive Interference
+void fireBeamAndAverage(int num_shots) {
     for(int i = 0; i < 5; i++) {
         for(int j = 0; j < BUFFER_LENGTH; j++) accumulation_buffers[i][j] = 0.0f;
     }
-    
+    for(int shot = 0; shot < num_shots; shot++) {
+        fireZeroDegreeBeam();
+        recordAcousticEchoes();
+        for(int i = 0; i < 5; i++) {
+            for(int j = 0; j < BUFFER_LENGTH; j++) accumulation_buffers[i][j] += rx_buffers[i][j];
+        }
+        delay(3); 
+    }
+    for(int i = 0; i < 5; i++) {
+        for(int j = 0; j < BUFFER_LENGTH; j++) rx_buffers[i][j] = accumulation_buffers[i][j] / (float)num_shots;
+    }
+    removeDCBias();
+}
+
+// Averages 100 shots of a SINGLE transmitter (For Gain Comparison)
+void fireSingleAndAverage(int tx_index, int num_shots) {
+    for(int i = 0; i < 5; i++) {
+        for(int j = 0; j < BUFFER_LENGTH; j++) accumulation_buffers[i][j] = 0.0f;
+    }
     for(int shot = 0; shot < num_shots; shot++) {
         fireSingleTX(tx_index);
         recordAcousticEchoes();
         for(int i = 0; i < 5; i++) {
             for(int j = 0; j < BUFFER_LENGTH; j++) accumulation_buffers[i][j] += rx_buffers[i][j];
         }
-        delay(5); // Feed watchdog timer to prevent crash
+        delay(3); 
     }
-    
     for(int i = 0; i < 5; i++) {
         for(int j = 0; j < BUFFER_LENGTH; j++) rx_buffers[i][j] = accumulation_buffers[i][j] / (float)num_shots;
     }
@@ -292,119 +268,104 @@ void setup() {
         digitalWrite(TX_TRIG[i], LOW); digitalWrite(TX_ECHO[i], LOW);
     }
     initHardwareDMA();
-    Serial.println("System Boot. Heavy-Duty Sequence Initiated.");
+    
+    // Launch the Thermodynamics task on Core 0 (Priority 1)
+    xTaskCreatePinnedToCore(bme280_task, "BME_Task", 4096, NULL, 1, NULL, 0);
+    
+    Serial.println("System Boot. Automated Brute-Force Tuning Initiated.");
     delay(2000); 
 }
 
 void loop() {
     switch(currentState) {
         
-        case CALIBRATE_RX:
-            Serial.println("Phase 1: RX Calibration (100-Shot Average & Integral Gain)...");
-            fireAndAverage(2, 100); 
-            
-            // Generate Gain Integrals First
-            calculateGainMultipliers(200, 300);
-            
-            // Generate Phase Delays
-            for(int i = 0; i < 5; i++) {
-                float measured_shift = calculateCrossCorrelationOffset(2, i, 200, 300);
-                float d_master = sqrt(pow(RX_X[2] - TX_X[2], 2) + pow(TARGET_Y, 2) + pow(RX_Z_OFFSET, 2));
-                float d_current = sqrt(pow(RX_X[i] - TX_X[2], 2) + pow(TARGET_Y, 2) + pow(RX_Z_OFFSET, 2));
-                
-                float time_diff = (d_current - d_master) / CALIBRATION_SPEED_OF_SOUND;
-                float theoretical_index_shift = time_diff * SAMPLE_RATE;
-                
-                rx_offsets[i] = measured_shift - theoretical_index_shift;
+        case EMPIRICAL_AUTO_TUNE:
+            // We skip the center TX (Index 2), it is our static anchor
+            if(tune_tx_idx == 2) {
+                tune_tx_idx++;
             }
-            currentState = CALIBRATE_TX;
-            delay(1000);
+            
+            if(tune_tx_idx < 5) {
+                Serial.printf("\n--- Brute-Forcing TX%d ---\n", tune_tx_idx + 1);
+                
+                float baseline = dynamic_tx_error[tune_tx_idx];
+                float best_offset = baseline;
+                float max_integral = 0;
+                
+                // Sweep 1000 nudges: -5.0 to +5.0 indices from baseline (in steps of 0.01)
+                for(int step = -500; step <= 500; step++) {
+                    float test_offset = baseline + (step * 0.01f);
+                    dynamic_tx_error[tune_tx_idx] = test_offset;
+                    
+                    // Fire 100 times to get a perfectly sterile wave, calculate AUC
+                    fireBeamAndAverage(100);
+                    float current_energy = getCenterIntegral();
+                    
+                    if(current_energy > max_integral) {
+                        max_integral = current_energy;
+                        best_offset = test_offset;
+                    }
+                    
+                    if(step % 100 == 0) {
+                        Serial.printf("Step %d/500 (Offset: %.2f) | Max Energy so far: %.2f\n", step, test_offset, max_integral);
+                    }
+                }
+                
+                // Lock the absolute best offset into memory
+                dynamic_tx_error[tune_tx_idx] = best_offset;
+                Serial.printf(">>> TX%d LOCKED AT OFFSET: %.4f <<<\n", tune_tx_idx + 1, best_offset);
+                
+                tune_tx_idx++;
+            } else {
+                // Done Tuning
+                Serial.println("\n========================================================");
+                Serial.println(">>> BRUTE-FORCE OPTIMIZATION COMPLETE. COPY THIS ARRAY <<<");
+                Serial.println("========================================================\n");
+                Serial.print("const float OPTIMIZED_TX_HW_ERROR[5] = {");
+                for(int i=0; i<5; i++) { Serial.printf("%.4f%s", dynamic_tx_error[i], (i<4)?", ":""); }
+                Serial.println("};\n");
+                
+                currentState = GAIN_COMPARISON;
+                delay(2000);
+            }
             break;
 
-        case CALIBRATE_TX:
-            if(tx_calib_index == 0) Serial.println("Phase 2: TX Calibration (Aligning the Beam)...");
+        case GAIN_COMPARISON:
+            Serial.println("\n--- RUNNING GAIN COMPARISON TEST ---");
             
-            fireAndAverage(tx_calib_index, 100); 
+            // 1. Fire strictly the center transmitter (No Beamforming)
+            fireSingleAndAverage(2, 100);
+            float single_tx_energy;
+            single_tx_energy = getCenterIntegral();
             
-            {
-                float tx_measured_shift = calculateCrossCorrelationOffset(2, 2, 200, 300); 
-                float d_tx_master = sqrt(pow(0.0 - TX_X[2], 2) + pow(TARGET_Y, 2));
-                float d_tx_current = sqrt(pow(0.0 - TX_X[tx_calib_index], 2) + pow(TARGET_Y, 2));
-                
-                float tx_time_diff = (d_tx_current - d_tx_master) / CALIBRATION_SPEED_OF_SOUND;
-                float tx_theoretical_shift = tx_time_diff * SAMPLE_RATE;
-                
-                tx_offsets[tx_calib_index] = tx_measured_shift - tx_theoretical_shift; 
-            }
+            // 2. Fire the fully optimized AESA Beam
+            fireBeamAndAverage(100);
+            float aesa_tx_energy;
+            aesa_tx_energy = getCenterIntegral();
             
-            tx_calib_index++;
-            if(tx_calib_index >= 5) {
-                currentState = PRINT_CALIB_FILE;
-                delay(1000);
-            }
-            break;
-
-        case PRINT_CALIB_FILE:
-            // This is your permanent, weather-immune hardware profile.
-            Serial.println("\n========================================================");
-            Serial.println(">>> CALIBRATION COMPLETE. COPY THIS INTO YOUR C++ CODE <<<");
-            Serial.println("========================================================\n");
+            Serial.printf("Single TX Center Energy: %.2f\n", single_tx_energy);
+            Serial.printf("AESA Beam Center Energy: %.2f\n", aesa_tx_energy);
+            Serial.printf(">>> ACOUSTIC MULTIPLIER: %.2fx GAIN <<<\n", aesa_tx_energy / single_tx_energy);
             
-            Serial.println("// Replace your global calibration arrays with these locked constants:");
-            
-            Serial.print("const float CALIB_RX_HW_ERROR[5] = {");
-            for(int i=0; i<5; i++) { Serial.printf("%.4f%s", rx_offsets[i], (i<4)?", ":""); }
-            Serial.println("};");
-            
-            Serial.print("const float CALIB_TX_HW_ERROR[5] = {");
-            for(int i=0; i<5; i++) { Serial.printf("%.4f%s", tx_offsets[i], (i<4)?", ":""); }
-            Serial.println("};");
-
-            Serial.print("const float CALIB_RX_GAIN[5] = {");
-            for(int i=0; i<5; i++) { Serial.printf("%.4f%s", rx_gain_multipliers[i], (i<4)?", ":""); }
-            Serial.println("};\n");
-            
-            Serial.println("========================================================\n");
-            
-            currentState = VERIFY_FIRE;
-            delay(2000);
-            break;
-
-        case VERIFY_FIRE:
-            Serial.println("Phase 3: VERIFY FIRE. Constructive Interference Incoming!");
-            
-            fireZeroDegreeBeam();
-            recordAcousticEchoes();
-            removeDCBias();
-            applyPhaseCorrection();
-            
-            // We only dump the tight target window to the Python script to prove it works
-            Serial.println("START_PLOT");
-            for(int j = 200; j < 350; j++) { 
-                Serial.printf("%.4f,%.4f,%.4f,%.4f,%.4f\n", 
-                    aligned_buffers[0][j], aligned_buffers[1][j], aligned_buffers[2][j], 
-                    aligned_buffers[3][j], aligned_buffers[4][j]);
-            }
-            Serial.println("END_PLOT");
-            
-            Serial.println("Matrix mathematically pure. Transitioning to M.U.S.I.C. Tracker in 5 seconds...");
+            Serial.println("\nTransitioning to Live M.U.S.I.C. Radar Stream...");
             currentState = MUSIC_DOA;
-            delay(5000); 
+            delay(5000);
             break;
 
         case MUSIC_DOA:
+            // Continuous AI radar streaming
             fireZeroDegreeBeam();
             recordAcousticEchoes();
             removeDCBias();
             applyPhaseCorrection();
             
-            Serial.println("START_PLOT");
-            for(int j = 200; j < 350; j++) { 
-                Serial.printf("%.4f,%.4f,%.4f,%.4f,%.4f\n", 
-                    aligned_buffers[0][j], aligned_buffers[1][j], aligned_buffers[2][j], 
-                    aligned_buffers[3][j], aligned_buffers[4][j]);
-            }
-            Serial.println("END_PLOT");
+            // Serial.println("START_PLOT");
+            // for(int j = 200; j < 350; j++) { 
+            //     Serial.printf("%.4f,%.4f,%.4f,%.4f,%.4f\n", 
+            //         aligned_buffers[0][j], aligned_buffers[1][j], aligned_buffers[2][j], 
+            //         aligned_buffers[3][j], aligned_buffers[4][j]);
+            // }
+            // Serial.println("END_PLOT");
             
             delay(16); 
             break;
