@@ -26,6 +26,10 @@ float rx_buffers[5][BUFFER_LENGTH] = {0};
 float aligned_buffers[5][BUFFER_LENGTH] = {0}; 
 float accumulation_buffers[5][BUFFER_LENGTH] = {0}; 
 
+const float CALIB_RX_HW_ERROR[5] = {0.8878, -2.3402, 0.0011, 0.2319, -2.7091};
+const float CALIB_TX_HW_ERROR[5] = {-0.0942, -0.0233, 0.0014, -0.0237, -0.0949};
+const float CALIB_RX_GAIN[5] = {0.8324, 1.0094, 1.0000, 1.0918, 0.9189};
+
 // DMA memory sized exactly for 1200 samples
 adc_continuous_handle_t adc_handle = NULL;
 const uint32_t DMA_FLAT_BUFFER_SIZE = 12000;
@@ -182,25 +186,78 @@ void IRAM_ATTR fireSingleTX(int tx_index) {
     portENABLE_INTERRUPTS();
 }
 
-void IRAM_ATTR fireAllTX_Aligned() {
-    portDISABLE_INTERRUPTS();
-    for (int i = 0; i < 8; i++) {
-        for(int tx = 0; tx < 5; tx++) {
-            REG_WRITE(GPIO_OUT_W1TS_REG, (1 << TX_TRIG[tx])); 
-            REG_WRITE(GPIO_OUT_W1TC_REG, (1 << TX_ECHO[tx])); 
+// ==============================================================================
+// PERFECT 0-DEGREE BROADSIDE BEAMFORMING
+// ==============================================================================
+void IRAM_ATTR fireZeroDegreeBeam() {
+    // 1. Find the Slowest Transmitter (Maximum positive hardware error)
+    float max_err = CALIB_TX_HW_ERROR[0];
+    for(int i = 1; i < 5; i++) {
+        if(CALIB_TX_HW_ERROR[i] > max_err) {
+            max_err = CALIB_TX_HW_ERROR[i];
         }
-        esp_rom_delay_us(12); 
-        for(int tx = 0; tx < 5; tx++) {
-            REG_WRITE(GPIO_OUT_W1TC_REG, (1 << TX_TRIG[tx])); 
-            REG_WRITE(GPIO_OUT_W1TS_REG, (1 << TX_ECHO[tx])); 
+    }
+
+    // 2. Calculate the required "Wait Time" for the faster transmitters
+    uint32_t start_delays[5];
+    for(int i = 0; i < 5; i++) {
+        float index_diff = max_err - CALIB_TX_HW_ERROR[i];
+        // 1 index = 2.0us = 480 CPU cycles (at 240MHz)
+        start_delays[i] = (uint32_t)(index_diff * 480.0f); 
+    }
+
+    // 3. Define the acoustic burst parameters
+    uint32_t half_period = 3000; // 12.5us HIGH (at 240MHz)
+    uint32_t full_period = 6000; // 25.0us FULL CYCLE (at 240MHz)
+    
+    // 4. Pre-calculate the exact CPU cycle timeline for all 5 pins (16 transitions total: 8 HIGH, 8 LOW)
+    uint32_t transitions[5][16];
+    for(int i = 0; i < 5; i++) {
+        for(int p = 0; p < 8; p++) {
+            transitions[i][p*2]     = start_delays[i] + (p * full_period);               // Time to turn HIGH
+            transitions[i][p*2 + 1] = start_delays[i] + (p * full_period) + half_period; // Time to turn LOW
         }
-        esp_rom_delay_us(12);
     }
-    for(int tx = 0; tx < 5; tx++) {
-        REG_WRITE(GPIO_OUT_W1TC_REG, (1 << TX_TRIG[tx]));
-        REG_WRITE(GPIO_OUT_W1TC_REG, (1 << TX_ECHO[tx]));
+
+    uint8_t state_index[5] = {0, 0, 0, 0, 0};
+    bool active = true;
+
+    portDISABLE_INTERRUPTS(); 
+    uint32_t start_time = xthal_get_ccount(); // Start the master CPU stopwatch
+
+    // 5. The Execution Matrix (Nanosecond Precision Spin-Lock)
+    while(active) {
+        uint32_t current_time = xthal_get_ccount() - start_time;
+        active = false;
+
+        for(int i = 0; i < 5; i++) {
+            if(state_index[i] < 16) {
+                active = true; // Keep the loop running until all 16 transitions for this pin are done
+                
+                // If the master stopwatch has reached this pin's scheduled transition time
+                if(current_time >= transitions[i][state_index[i]]) {
+                    if(state_index[i] % 2 == 0) {
+                        // POSITIVE SWING (Push-Pull)
+                        REG_WRITE(GPIO_OUT_W1TS_REG, (1 << TX_TRIG[i]));
+                        REG_WRITE(GPIO_OUT_W1TC_REG, (1 << TX_ECHO[i]));
+                    } else {
+                        // NEGATIVE SWING (Push-Pull)
+                        REG_WRITE(GPIO_OUT_W1TC_REG, (1 << TX_TRIG[i]));
+                        REG_WRITE(GPIO_OUT_W1TS_REG, (1 << TX_ECHO[i]));
+                    }
+                    state_index[i]++; // Move to the next scheduled event for this pin
+                }
+            }
+        }
     }
-    esp_rom_delay_us(800); 
+
+    // 6. INSTANT BRAKE (Violently ground all crystals to stop ringing)
+    for(int i = 0; i < 5; i++) {
+        REG_WRITE(GPIO_OUT_W1TC_REG, (1 << TX_TRIG[i]));
+        REG_WRITE(GPIO_OUT_W1TC_REG, (1 << TX_ECHO[i]));
+    }
+
+    esp_rom_delay_us(800); // Hardware range gate
     portENABLE_INTERRUPTS();
 }
 
@@ -316,7 +373,7 @@ void loop() {
         case VERIFY_FIRE:
             Serial.println("Phase 3: VERIFY FIRE. Constructive Interference Incoming!");
             
-            fireAllTX_Aligned();
+            fireZeroDegreeBeam();
             recordAcousticEchoes();
             removeDCBias();
             applyPhaseCorrection();
@@ -336,7 +393,7 @@ void loop() {
             break;
 
         case MUSIC_DOA:
-            fireAllTX_Aligned();
+            fireZeroDegreeBeam();
             recordAcousticEchoes();
             removeDCBias();
             applyPhaseCorrection();
