@@ -6,23 +6,22 @@
 #include <math.h>
 
 // ==============================================================================
-// 1. HARDWARE PINS
+// 1. HARDWARE PINS & GEOMETRY
 // ==============================================================================
 const int TX_TRIG[5] = {4, 14, 17, 19, 25};
 const int TX_ECHO[5] = {13, 16, 18, 23, 26};
 const adc_channel_t RX_CHANNELS[5] = {ADC_CHANNEL_4, ADC_CHANNEL_5, ADC_CHANNEL_7, ADC_CHANNEL_0, ADC_CHANNEL_3};
+const float TX_X[5] = {-0.0084, -0.0042, 0.0, 0.0042, 0.0084};
 
 // ==============================================================================
 // 2. THE HYBRID CALIBRATION MATRIX
 // ==============================================================================
-// Brute-Forced Transmit Offsets
 const float OPTIMIZED_TX_HW_ERROR[5] = {3.0758, -0.9833, 0.0014, -0.0937, 4.0451};
-
-// Extracted Receiver Phase and Gain Offsets
 const float CALIB_RX_HW_ERROR[5] = {0.8830, -2.3373, 0.0001, 0.2231, -2.7072};
 const float CALIB_RX_GAIN[5] = {0.7992, 0.9419, 1.0000, 1.1074, 0.9922};
 
-uint32_t active_tx_cycles[5]; 
+const float SCAN_ANGLES[5] = {-40.0, -20.0, 0.0, 20.0, 40.0};
+uint32_t active_tx_cycles[5][5]; // [Sector][Pin]
 
 // ==============================================================================
 // 3. MASSIVE MEMORY ALLOCATION & DMA
@@ -35,9 +34,9 @@ adc_continuous_handle_t tws_adc_handle = NULL;
 const uint32_t DMA_FLAT_BUFFER_SIZE = 24000;
 uint8_t dma_flat_buffer[DMA_FLAT_BUFFER_SIZE] = {0};
 
-// FreeRTOS Synchronization Locks
 SemaphoreHandle_t dma_data_ready_sem;
 SemaphoreHandle_t serial_print_done_sem;
+volatile int shared_sector = 0; 
 
 // ==============================================================================
 // 4. SIGNAL PROCESSING (CORE 0)
@@ -45,8 +44,7 @@ SemaphoreHandle_t serial_print_done_sem;
 void removeDCBias() {
     for(int i = 0; i < 5; i++) {
         float sum = 0;
-        // Deep silence baseline to avoid electrical crosstalk
-        for(int j = 100; j < 180; j++) sum += rx_buffers[i][j];
+        for(int j = 100; j < 180; j++) sum += rx_buffers[i][j]; 
         float bias = sum / 80.0f;
         for(int j = 0; j < BUFFER_LENGTH; j++) rx_buffers[i][j] -= bias;
     }
@@ -66,9 +64,6 @@ void applyPhaseAndGainCorrection() {
     }
 }
 
-// ==============================================================================
-// 5. HARDWARE INITIALIZATION
-// ==============================================================================
 void initHardwareDMA() {
     adc_continuous_handle_cfg_t adc_config = { .max_store_buf_size = 24000, .conv_frame_size = 1000 };
     ESP_ERROR_CHECK(adc_continuous_new_handle(&adc_config, &tws_adc_handle));
@@ -89,16 +84,17 @@ void initHardwareDMA() {
 }
 
 // ==============================================================================
-// 6. CORE 1 TASK (THE PHYSICS ENGINE)
+// 5. CORE 1 TASK (THE PHYSICS ENGINE)
 // ==============================================================================
 void physicsTask(void *pvParameters) {
+    int current_firing_sector = 0;
+    
     while (true) {
         xSemaphoreTake(serial_print_done_sem, portMAX_DELAY);
 
-        // A. 8-PULSE PUSH-PULL BEAMFORMING (0 Degrees)
         uint32_t edge_times[5][16];
         for (int i = 0; i < 5; i++) {
-            uint32_t base_delay = active_tx_cycles[i];
+            uint32_t base_delay = active_tx_cycles[current_firing_sector][i];
             for (int e = 0; e < 16; e++) {
                 edge_times[i][e] = base_delay + (e * 3000); 
             }
@@ -137,10 +133,8 @@ void physicsTask(void *pvParameters) {
         }
         portENABLE_INTERRUPTS();
 
-        // B. TIME GATING (250 microseconds)
         delayMicroseconds(250);
 
-        // C. DMA HIGH-SPEED RECORDING
         ESP_ERROR_CHECK(adc_continuous_start(tws_adc_handle));
         uint32_t total_bytes_read = 0;
         
@@ -152,7 +146,6 @@ void physicsTask(void *pvParameters) {
         }
         ESP_ERROR_CHECK(adc_continuous_stop(tws_adc_handle));
 
-        // D. PARSE RAW DMA BYTES
         int rx_indices[5] = {0, 0, 0, 0, 0};
         for (int i = 0; i < DMA_FLAT_BUFFER_SIZE; i += SOC_ADC_DIGI_RESULT_BYTES) {
             adc_digi_output_data_t *p = (adc_digi_output_data_t*)&dma_flat_buffer[i];
@@ -165,12 +158,20 @@ void physicsTask(void *pvParameters) {
             else if (p->type1.channel == ADC_CHANNEL_3 && rx_indices[4] < BUFFER_LENGTH) rx_buffers[4][rx_indices[4]++] = volt;
         }
 
+        shared_sector = current_firing_sector;
+        current_firing_sector = (current_firing_sector + 1) % 5; 
+        
+        // --- ACOUSTIC COOLDOWN ---
+        // Give the physical room 12 milliseconds to go completely silent
+        // before firing the next sector. This kills reverberation ghosts.
+        vTaskDelay(pdMS_TO_TICKS(12));
+
         xSemaphoreGive(dma_data_ready_sem); 
     }
 }
 
 // ==============================================================================
-// 7. CORE 0 TASK (THE COMMUNICATIONS ENGINE)
+// 6. CORE 0 TASK (THE COMMUNICATIONS ENGINE)
 // ==============================================================================
 void commsTask(void *pvParameters) {
     while (true) {
@@ -179,21 +180,20 @@ void commsTask(void *pvParameters) {
         removeDCBias();
         applyPhaseAndGainCorrection();
 
-        Serial.println("START_PLOT");
-        // Outputting exactly 150 indices for the Python script
+        Serial.printf("START_PLOT_%d\n", shared_sector);
         for(int j = 200; j < 350; j++) { 
             Serial.printf("%.1f,%.1f,%.1f,%.1f,%.1f\n", 
                 aligned_buffers[0][j], aligned_buffers[1][j], aligned_buffers[2][j], 
                 aligned_buffers[3][j], aligned_buffers[4][j]);
         }
-        Serial.println("END_PLOT");
+        Serial.printf("END_PLOT_%d\n", shared_sector);
 
         xSemaphoreGive(serial_print_done_sem); 
     }
 }
 
 // ==============================================================================
-// 8. SYSTEM BOOTSTRAP
+// 7. SYSTEM BOOTSTRAP (DYNAMIC TRIGONOMETRY ENGINE)
 // ==============================================================================
 void setup() {
     Serial.begin(500000); 
@@ -206,13 +206,26 @@ void setup() {
         digitalWrite(TX_ECHO[i], LOW);
     }
     
-    float min_offset = OPTIMIZED_TX_HW_ERROR[0];
-    for (int i = 1; i < 5; i++) {
-        if (OPTIMIZED_TX_HW_ERROR[i] < min_offset) min_offset = OPTIMIZED_TX_HW_ERROR[i];
-    }
-    for (int i = 0; i < 5; i++) {
-        float precise_hw_us = (OPTIMIZED_TX_HW_ERROR[i] - min_offset) * 2.0;
-        active_tx_cycles[i] = (uint32_t)(precise_hw_us * 240.0); 
+    float min_hw = OPTIMIZED_TX_HW_ERROR[0];
+    for (int i = 1; i < 5; i++) if (OPTIMIZED_TX_HW_ERROR[i] < min_hw) min_hw = OPTIMIZED_TX_HW_ERROR[i];
+    
+    for (int s = 0; s < 5; s++) {
+        float angle_rad = SCAN_ANGLES[s] * M_PI / 180.0;
+        float combined_us[5];
+        float min_combined = 1000000.0f;
+
+        for (int i = 0; i < 5; i++) {
+            float hw_delay = (OPTIMIZED_TX_HW_ERROR[i] - min_hw) * 2.0;
+            float geo_delay_sec = (TX_X[i] * sin(angle_rad)) / 343.0;
+            float geo_delay_us = geo_delay_sec * 1000000.0;
+
+            combined_us[i] = hw_delay + geo_delay_us;
+            if (combined_us[i] < min_combined) min_combined = combined_us[i];
+        }
+
+        for (int i = 0; i < 5; i++) {
+            active_tx_cycles[s][i] = (uint32_t)((combined_us[i] - min_combined) * 240.0);
+        }
     }
 
     initHardwareDMA();
@@ -222,7 +235,7 @@ void setup() {
     xSemaphoreGive(serial_print_done_sem);
 
     Serial.println("\n========================================================");
-    Serial.println(">>> 0-DEGREE DUAL-CORE BORESIGHT ENGINE ONLINE       <<<");
+    Serial.println(">>> TWS DUAL-CORE ENGINE ONLINE (COOLDOWN ENABLED)   <<<");
     Serial.println("========================================================\n");
 
     xTaskCreatePinnedToCore(physicsTask, "PhysicsCore1", 8192, NULL, 2, NULL, 1);
