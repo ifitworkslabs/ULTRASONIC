@@ -15,13 +15,11 @@ const adc_channel_t RX_CHANNELS[5] = {ADC_CHANNEL_4, ADC_CHANNEL_5, ADC_CHANNEL_
 // ==============================================================================
 // 2. THE HYBRID CALIBRATION MATRIX
 // ==============================================================================
-// YESTERDAY'S BRUTE-FORCED TRANSMIT OFFSETS (Maximum Constructive Interference)
+// Brute-Forced Transmit Offsets
 const float OPTIMIZED_TX_HW_ERROR[5] = {3.0758, -0.9833, 0.0014, -0.0937, 4.0451};
 
-// TODAY'S EXTRACTED RECEIVER PHASE OFFSETS
+// Extracted Receiver Phase and Gain Offsets
 const float CALIB_RX_HW_ERROR[5] = {0.8830, -2.3373, 0.0001, 0.2231, -2.7072};
-
-// TODAY'S EXTRACTED RECEIVER GAIN MULTIPLIERS
 const float CALIB_RX_GAIN[5] = {0.7992, 0.9419, 1.0000, 1.1074, 0.9922};
 
 uint32_t active_tx_cycles[5]; 
@@ -47,13 +45,9 @@ SemaphoreHandle_t serial_print_done_sem;
 void removeDCBias() {
     for(int i = 0; i < 5; i++) {
         float sum = 0;
-        // Shift the sampling window deep into the "dead quiet" zone (indices 100 to 180)
-        // This completely avoids the electrical ringing from the transmission blast
+        // Deep silence baseline to avoid electrical crosstalk
         for(int j = 100; j < 180; j++) sum += rx_buffers[i][j];
-        
-        float bias = sum / 80.0f; // Divide by the new 80-index window
-        
-        // Snap the entire wave precisely to 0.0
+        float bias = sum / 80.0f;
         for(int j = 0; j < BUFFER_LENGTH; j++) rx_buffers[i][j] -= bias;
     }
 }
@@ -66,7 +60,6 @@ void applyPhaseAndGainCorrection() {
         for(int j = 0; j < BUFFER_LENGTH; j++) {
             int new_index = j - discrete_shift; 
             if(new_index >= 0 && new_index < BUFFER_LENGTH) {
-                // Apply phase shift AND balance the volume across all 5 mics
                 aligned_buffers[i][new_index] = rx_buffers[i][j] * CALIB_RX_GAIN[i];
             }
         }
@@ -187,7 +180,7 @@ void commsTask(void *pvParameters) {
         applyPhaseAndGainCorrection();
 
         Serial.println("START_PLOT");
-        // Sending indices 200 to 350 to perfectly frame the 54cm target zone
+        // Outputting exactly 150 indices for the Python script
         for(int j = 200; j < 350; j++) { 
             Serial.printf("%.1f,%.1f,%.1f,%.1f,%.1f\n", 
                 aligned_buffers[0][j], aligned_buffers[1][j], aligned_buffers[2][j], 
@@ -229,8 +222,7 @@ void setup() {
     xSemaphoreGive(serial_print_done_sem);
 
     Serial.println("\n========================================================");
-    Serial.println(">>> DUAL-CORE RADAR ENGINE ONLINE                    <<<");
-    Serial.println(">>> HYBRID CALIBRATION MATRIX ACTIVE                 <<<");
+    Serial.println(">>> 0-DEGREE DUAL-CORE BORESIGHT ENGINE ONLINE       <<<");
     Serial.println("========================================================\n");
 
     xTaskCreatePinnedToCore(physicsTask, "PhysicsCore1", 8192, NULL, 2, NULL, 1);
