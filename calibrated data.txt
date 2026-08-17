@@ -1,0 +1,17 @@
+1. The Transmitter Array (TX)
+const int CALIB_TX_HW_TICKS[5] = {361, 2015, 179, 2017, 0};
+
+The Unit: 240MHz CPU Ticks
+
+The Physical Scale: 1 Unit = 4.16 nanoseconds
+
+The Mechanics: This array operates in pure processor clock cycles. When the array dictates that TX1 is 2015, it means the ESP32 silicon must physically count exactly 2,015 clock cycles (which takes roughly 8,382 nanoseconds) before it allows the electrical spark to travel to that specific piezoelectric disc. It forces the faster transmitters to wait on the starting line so the sluggish ones can catch up.
+
+2. The Receiver Array (RX)
+const float CALIB_RX_HW_ERROR[5] = {24.0000, 32.0000, 0.0000, 0.0000, -8.0000};
+
+The Unit: 400kHz DMA Buffer Indices (Array Slots)
+
+The Physical Scale: 1 Unit = 2.5 microseconds (2,500 nanoseconds)
+
+The Mechanics: This array operates in memory addresses. Because your 2 MHz Analog-to-Digital Converter is multiplexing across 5 microphones, each microphone gets sampled exactly once every 2.5 microseconds. When the array says RX0 is 24.0000, it means the physical acoustic wave crashed into that microphone's memory buffer exactly 24 slots (or 60 microseconds) later than the center anchor.
