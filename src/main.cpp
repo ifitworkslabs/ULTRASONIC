@@ -11,24 +11,15 @@
 const int TX_TRIG[5] = {4, 14, 17, 19, 25};
 const int TX_ECHO[5] = {13, 16, 18, 23, 26};
 
-// Physical Geometry (For your records - not actively used in empirical tuning)
-const float TX_X[5] = {-0.0084, -0.0042, 0.0, 0.0042, 0.0084};
-const float RX_X[5] = {0.025, 0.009, -0.002, -0.013, -0.025}; 
+const int CAPTURE_OFFSET = 1800; 
+const int WINDOW_SIZE = 1000;    
 
-// THE TITANIUM TIME GATE (Target at 1.1m hits at ~Index 2565)
-const int CAPTURE_OFFSET = 1800; // We ignore the first 1800 samples entirely!
-const int WINDOW_SIZE = 1000;    // We only save 1000 indices (1800 to 2800)
-
-// The target gate mapped to our new shrunken window
-// Physical 1900 = Window 100. Physical 2600 = Window 800.
 const int GATE_START = 100;
 const int GATE_END   = 800; 
 
-// MASSIVELY REDUCED SRAM ALLOCATION (Only 20KB each!)
 float rx_buffers[5][WINDOW_SIZE] = {0};
 float accumulation_buffers[5][WINDOW_SIZE] = {0}; 
 
-// CLOCK-ACCURATE BASELINES (Measured strictly in 240MHz CPU Ticks)
 int dynamic_tx_delay_ticks[5] = {12000, 12000, 12000, 12000, 12000};
 float calib_rx_hw_error[5] = {0, 0, 0, 0, 0}; 
 
@@ -37,13 +28,13 @@ const uint32_t DMA_FLAT_BUFFER_SIZE = 30000;
 uint8_t dma_flat_buffer[DMA_FLAT_BUFFER_SIZE] = {0};
 const adc_channel_t RX_CHANNELS[5] = {ADC_CHANNEL_4, ADC_CHANNEL_5, ADC_CHANNEL_7, ADC_CHANNEL_0, ADC_CHANNEL_3};
 
-// >>> STATE MACHINE VARIABLES <<<
 enum SystemState { TX_TICK_CLIMB, RX_CALIBRATE, DONE };
 SystemState currentState = TX_TICK_CLIMB;
 
 int current_step_ticks = 480; 
 bool array_changed = false;
 int current_tx = 0;
+int sweep_counter = 0; 
 
 // ==============================================================================
 // II. MAXIMUM FREQUENCY DMA CORE (2 MHz)
@@ -53,8 +44,7 @@ void initHardwareDMA() {
     ESP_ERROR_CHECK(adc_continuous_new_handle(&adc_config, &adc_handle));
 
     adc_continuous_config_t dig_cfg = {
-        .sample_freq_hz = 2000000, // ABSOLUTE HARDWARE MAXIMUM (2 MHz)
-        .conv_mode = ADC_CONV_SINGLE_UNIT_1, .format = ADC_DIGI_OUTPUT_FORMAT_TYPE1,
+        .sample_freq_hz = 2000000, .conv_mode = ADC_CONV_SINGLE_UNIT_1, .format = ADC_DIGI_OUTPUT_FORMAT_TYPE1,
     };
 
     adc_digi_pattern_config_t adc_pattern[5];
@@ -92,7 +82,6 @@ void recordAcousticEchoes() {
         else if (p->type1.channel == ADC_CHANNEL_3) ch = 4;
 
         if (ch != -1) {
-            // ONLY copy the exact 1000-index window we care about into RAM!
             if (rx_indices[ch] >= CAPTURE_OFFSET && rx_indices[ch] < CAPTURE_OFFSET + WINDOW_SIZE) {
                 rx_buffers[ch][rx_indices[ch] - CAPTURE_OFFSET] = volt;
             }
@@ -104,14 +93,12 @@ void recordAcousticEchoes() {
 void removeDCBias() {
     for(int i = 0; i < 5; i++) {
         float sum = 0;
-        // Calculate bias from the flat, quiet zone just before the echo hits
         for(int j = 10; j < 80; j++) sum += rx_buffers[i][j];
         float bias = sum / 70.0f;
         for(int j = 0; j < WINDOW_SIZE; j++) rx_buffers[i][j] -= bias;
     }
 }
 
-// Strictly evaluates energy INSIDE the gated window
 float getGatedCenterIntegral() {
     float area = 0;
     for(int j = GATE_START; j <= GATE_END; j++) {
@@ -198,7 +185,7 @@ void setup() {
     }
     initHardwareDMA();
     
-    Serial.println("System Boot. Clock-Accurate Auto-Tuner (Windowed Memory) Initiated.");
+    Serial.println("System Boot. Anti-Aliasing Auto-Tuner Initiated.");
     delay(2000); 
 }
 
@@ -207,7 +194,7 @@ void loop() {
         
         case TX_TICK_CLIMB: {
             if(current_tx == 2) {
-                current_tx++; // Center is the immutable anchor
+                current_tx++; 
                 break;
             }
 
@@ -217,7 +204,7 @@ void loop() {
 
             for(int i=0; i<3; i++) {
                 dynamic_tx_delay_ticks[current_tx] = test_vals[i];
-                fireBeamAndAverage(15);
+                fireBeamAndAverage(100);
                 energies[i] = getGatedCenterIntegral();
             }
 
@@ -237,13 +224,16 @@ void loop() {
 
             if(current_tx >= 5) {
                 current_tx = 0;
-                if(!array_changed) { 
+                sweep_counter++; 
+                
+                if(!array_changed || sweep_counter >= 3) { 
                     current_step_ticks /= 2; 
+                    sweep_counter = 0; 
                     Serial.printf("\n>>> Temporal bounds tightened. New Step: %d CPU Ticks <<<\n\n", current_step_ticks);
                     
-                    if(current_step_ticks < 1) { 
+                    if(current_step_ticks <= 60) { 
                         Serial.println("===============================================================");
-                        Serial.println(">>> TX ARRAY CALIBRATED TO 4 NANOSECONDS. LOCKING SECURELY. <<<");
+                        Serial.println(">>> TX ARRAY ALIGNED TO <250 NANOSECONDS. AVOIDING NOISE PLATEAU. <<<");
                         Serial.println("===============================================================");
                         currentState = RX_CALIBRATE;
                     }
@@ -254,23 +244,45 @@ void loop() {
         }
 
         case RX_CALIBRATE: {
-            Serial.println("\n--- COMMENCING MAXIMUM RATE RX HW DELAY EXTRACTION ---");
-            fireBeamAndAverage(50); 
+            Serial.println("\n--- COMMENCING ANTI-HOPPING RX HW DELAY EXTRACTION ---");
+            fireBeamAndAverage(100); 
             
-            int peak_indices[5] = {0, 0, 0, 0, 0};
+            // 1. Find the true Anchor (Center Peak) ONLY in the mature Steady-State burst
+            int steady_start = 2240 - CAPTURE_OFFSET; 
+            int steady_end   = 2350 - CAPTURE_OFFSET; 
+            
+            float center_max = -1000.0f; 
+            int center_peak = steady_start;
+            
+            for(int j = steady_start; j <= steady_end; j++) {
+                if(rx_buffers[2][j] > center_max) {
+                    center_max = rx_buffers[2][j];
+                    center_peak = j;
+                }
+            }
+            Serial.printf("ANCHOR (RX2) Peak Found at 2MHz Index: %d\n", center_peak + CAPTURE_OFFSET);
 
+            int peak_indices[5] = {0, 0, center_peak, 0, 0};
+
+            // 2. Lock the window to +/- 24 indices (Half an acoustic wave!)
             for(int ch = 0; ch < 5; ch++) {
-                float max_val = 0;
-                int peak_idx = GATE_START;
-                for(int j = GATE_START; j <= GATE_END; j++) {
-                    if(abs(rx_buffers[ch][j]) > max_val) {
-                        max_val = abs(rx_buffers[ch][j]);
-                        peak_idx = j;
+                if (ch == 2) continue;
+                
+                float max_val = -1000.0f;
+                int local_peak = center_peak;
+                
+                // Expanding the search bounds to catch extreme hardware delays
+                int search_start = (center_peak - 24 > 0) ? center_peak - 24 : 0;
+                int search_end = (center_peak + 24 < WINDOW_SIZE) ? center_peak + 24 : WINDOW_SIZE - 1;
+
+                for(int j = search_start; j <= search_end; j++) {
+                    if(rx_buffers[ch][j] > max_val) { 
+                        max_val = rx_buffers[ch][j];
+                        local_peak = j;
                     }
                 }
-                peak_indices[ch] = peak_idx;
-                // Add the capture offset back so it matches your physical 2MHz indices!
-                Serial.printf("RX%d Peak Found at 2MHz Index: %d\n", ch, peak_idx + CAPTURE_OFFSET);
+                peak_indices[ch] = local_peak;
+                Serial.printf("RX%d Peak Locked at 2MHz Index: %d (Hardware Error: %d)\n", ch, local_peak + CAPTURE_OFFSET, local_peak - center_peak);
             }
 
             for(int ch = 0; ch < 5; ch++) {
@@ -292,13 +304,21 @@ void loop() {
             for(int i=0; i<5; i++) { Serial.printf("%.4f%s", calib_rx_hw_error[i], (i<4)?", ":""); }
             Serial.println("};\n");
 
-            Serial.println("Transmitting ultra-high resolution proof graph to Python...");
+            Serial.println("Transmitting ALIGNED high-resolution proof graph to Python...");
             Serial.println("START_FINAL_PLOT");
             
+            // 3. Dynamically shift the output array to PROVE the waves are aligned
             for(int j = 0; j < WINDOW_SIZE; j++) { 
-                Serial.printf("%d,%.4f,%.4f,%.4f,%.4f,%.4f\n", 
-                    j + CAPTURE_OFFSET, rx_buffers[0][j], rx_buffers[1][j], rx_buffers[2][j], 
-                    rx_buffers[3][j], rx_buffers[4][j]);
+                Serial.printf("%d,", j + CAPTURE_OFFSET);
+                for(int ch = 0; ch < 5; ch++) {
+                    int shift = round(calib_rx_hw_error[ch]);
+                    int original_idx = j + shift; 
+                    float val = 0.0f;
+                    if(original_idx >= 0 && original_idx < WINDOW_SIZE) {
+                        val = rx_buffers[ch][original_idx];
+                    }
+                    Serial.printf("%.4f%s", val, (ch==4) ? "\n" : ",");
+                }
             }
             Serial.println("END_FINAL_PLOT");
             

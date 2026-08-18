@@ -1,71 +1,84 @@
 import serial
+import numpy as np
 import matplotlib.pyplot as plt
-import sys
 
-COM_PORT = 'COM3'  # Verify your exact ESP32 Port
-BAUD_RATE = 115200
+# --- HARDWARE CONFIGURATION ---
+PORT = 'COM3'  # You must change this to match your ESP32's COM Port
+BAUD = 115200
+
+print("==================================================")
+print("Professor's Python Terminal: Listening to the ESP32...")
+print("==================================================\n")
 
 try:
-    ser = serial.Serial(COM_PORT, BAUD_RATE, timeout=0.1)
-    print(f"Connected to ESP32 on {COM_PORT}. Listening to 4.16ns Auto-Tuner...")
+    ser = serial.Serial(PORT, BAUD, timeout=10)
 except Exception as e:
-    print(f"Connection Failed: {e}")
-    sys.exit()
+    print(f"CRITICAL ERROR: Failed to open port {PORT}. Is the ESP32 plugged in?")
+    exit()
 
-indices = []
-rx_data = {0: [], 1: [], 2: [], 3: [], 4: []}
 recording = False
+indices = []
+buffer_data = []
 
+# --- LISTEN AND PARSE ---
 while True:
     try:
         raw_line = ser.readline()
-        if not raw_line: continue
+        if not raw_line:
+            continue
             
         line = raw_line.decode('utf-8', errors='ignore').strip()
         
-        if not recording and not line.startswith("START_FINAL_PLOT"):
-            print(line)
-        
-        if line == "START_FINAL_PLOT":
-            print("\nCatching ultra-high resolution waveform data...")
+        # Print the ESP32's progress to the terminal
+        if not recording and line:
+            print(line) 
+            
+        if "START_FINAL_PLOT" in line:
+            print("\n>>> PYTHON: Target locked. Receiving Pre-Aligned Master Matrix...")
             recording = True
             continue
             
-        elif line == "END_FINAL_PLOT":
-            print("\nSuccess! Rendering 2MHz Proof Graph...")
-            break
-            
-        elif recording:
-            vals = line.split(',')
-            if len(vals) == 6:
-                indices.append(int(vals[0]))
-                for i in range(5):
-                    rx_data[i].append(float(vals[i+1]))
+        if recording:
+            if "END_FINAL_PLOT" in line:
+                print(">>> PYTHON: Matrix transfer complete. Initiating Plot Protocol.")
+                break
+            else:
+                # Capture the comma-separated values
+                try:
+                    vals = [float(v) for v in line.split(",") if v]
                     
-    except KeyboardInterrupt:
-        print("\nAborted.")
+                    # WE NOW EXPECT 6 VALUES: (1 Index + 5 Voltages)
+                    if len(vals) == 6: 
+                        indices.append(vals[0])      # Save the X-axis index
+                        buffer_data.append(vals[1:]) # Save the 5 Y-axis voltages
+                except ValueError:
+                    pass # Ignore random serial garbage
+                    
+    except serial.SerialException as e:
+        print(f"\nUSB CRASH: The ESP32 pulled too much power and disconnected. {e}")
         break
 
 ser.close()
 
-if len(indices) > 0:
-    plt.figure(figsize=(12, 6))
-    plt.title("Post-Calibration Alignment (2MHz Sample Rate / 4.16ns TX Precision)", fontsize=16, fontweight='bold')
+# --- MATHEMATICAL CORRECTION & PLOTTING ---
+if len(buffer_data) > 0:
+    # Convert to NumPy array and transpose to get 5 distinct channels
+    aligned_matrix = np.array(buffer_data).T 
+        
+    # Generate the Proof Graph
+    plt.figure(figsize=(14, 7))
+    plt.title("Hardware-Corrected Phase Alignment (2MHz DMA & Plateau Locked)", fontsize=18, fontweight='bold')
     
     colors = ['blue', 'orange', 'green', 'red', 'purple']
     for i in range(5):
-        plt.plot(indices, rx_data[i], label=f'RX Channel {i}', color=colors[i], alpha=0.7)
-    
-    # Render the new Time Gate bounds
-    plt.axvline(x=1900, color='black', linestyle='--', linewidth=2, label='Gate Start (1900)')
-    plt.axvline(x=2600, color='black', linestyle='--', linewidth=2, label='Gate End (2600)')
-    
-    plt.xlabel("Hardware Buffer Index (High Resolution)", fontsize=12)
+        plt.plot(indices, aligned_matrix[i], label=f"RX Channel {i}", color=colors[i], alpha=0.8)
+        
+    plt.xlim(2000, 2500) # Zoom into the exact window where the echo strikes
+    plt.xlabel("Hardware Buffer Index (2MHz)", fontsize=12)
     plt.ylabel("Voltage", fontsize=12)
     plt.grid(True, linestyle=':', alpha=0.7)
-    plt.legend()
-    
-    # Zoom deeply into the target
-    plt.xlim(1600, 2800) 
+    plt.legend(loc='upper right')
     plt.tight_layout()
     plt.show()
+else:
+    print("\nFailure: No matrix data was received. Check the wiring and restart.")
