@@ -6,46 +6,39 @@
 #include <math.h>
 
 // ==============================================================================
-// I. HARDWARE GEOMETRY & WINDOWED MEMORY ARCHITECTURE
+// I. THE GOLDEN CALIBRATION KEYS (Locked at 2 MHz)
 // ==============================================================================
 const int TX_TRIG[5] = {4, 14, 17, 19, 25};
 const int TX_ECHO[5] = {13, 16, 18, 23, 26};
 
+// Your dynamically extracted hardware delays
+const int CALIB_TX_HW_TICKS[5] = {600, 1680, 1320, 2040, 0};
+const float CALIB_RX_HW_ERROR[5] = {-8.2302, 7.6886, 0.0000, -7.8158, 7.6084};
+
+// High-Resolution 2 MHz Windowing
 const int CAPTURE_OFFSET = 1800; 
 const int WINDOW_SIZE = 1000;    
 
-const int GATE_START = 100;
-const int GATE_END   = 800; 
-
 float rx_buffers[5][WINDOW_SIZE] = {0};
 float accumulation_buffers[5][WINDOW_SIZE] = {0}; 
-
-int dynamic_tx_delay_ticks[5] = {12000, 12000, 12000, 12000, 12000};
-float calib_rx_hw_error[5] = {0, 0, 0, 0, 0}; 
 
 adc_continuous_handle_t adc_handle = NULL;
 const uint32_t DMA_FLAT_BUFFER_SIZE = 30000; 
 uint8_t dma_flat_buffer[DMA_FLAT_BUFFER_SIZE] = {0};
 
+// Hardware Polling Sequence (Maintained to prevent silicon crash)
 const adc_channel_t RX_CHANNELS[5] = {ADC_CHANNEL_4, ADC_CHANNEL_5, ADC_CHANNEL_7, ADC_CHANNEL_0, ADC_CHANNEL_3};
 
-enum SystemState { TX_TICK_CLIMB, RX_CALIBRATE, DONE };
-SystemState currentState = TX_TICK_CLIMB;
-
-int current_step_ticks = 480; 
-bool array_changed = false;
-int current_tx = 0;
-int sweep_counter = 0; 
-
 // ==============================================================================
-// II. MAXIMUM FREQUENCY DMA CORE (2 MHz)
+// II. HIGH-RESOLUTION DMA CORE (2 MHz)
 // ==============================================================================
 void initHardwareDMA() {
     adc_continuous_handle_cfg_t adc_config = { .max_store_buf_size = 20480, .conv_frame_size = 2000 };
     ESP_ERROR_CHECK(adc_continuous_new_handle(&adc_config, &adc_handle));
 
     adc_continuous_config_t dig_cfg = {
-        .sample_freq_hz = 2000000, .conv_mode = ADC_CONV_SINGLE_UNIT_1, .format = ADC_DIGI_OUTPUT_FORMAT_TYPE1,
+        .sample_freq_hz = 2000000, 
+        .conv_mode = ADC_CONV_SINGLE_UNIT_1, .format = ADC_DIGI_OUTPUT_FORMAT_TYPE1,
     };
 
     adc_digi_pattern_config_t adc_pattern[5];
@@ -76,11 +69,12 @@ void recordAcousticEchoes() {
         float volt = (float)p->type1.data / 4095.0f;
         
         int ch = -1;
-        if (p->type1.channel == ADC_CHANNEL_5) ch = 0;      
-        else if (p->type1.channel == ADC_CHANNEL_4) ch = 1; 
-        else if (p->type1.channel == ADC_CHANNEL_7) ch = 2; 
-        else if (p->type1.channel == ADC_CHANNEL_3) ch = 3; 
-        else if (p->type1.channel == ADC_CHANNEL_0) ch = 4; 
+        // The True Physical Geometric Parser (Left to Right)
+        if (p->type1.channel == ADC_CHANNEL_5) ch = 0;      // GPIO 33 (Leftmost)
+        else if (p->type1.channel == ADC_CHANNEL_4) ch = 1; // GPIO 32 (Mid-Left)
+        else if (p->type1.channel == ADC_CHANNEL_7) ch = 2; // GPIO 35 (Center)
+        else if (p->type1.channel == ADC_CHANNEL_3) ch = 3; // GPIO 39 (Mid-Right)
+        else if (p->type1.channel == ADC_CHANNEL_0) ch = 4; // GPIO 36 (Rightmost)
 
         if (ch != -1) {
             if (rx_indices[ch] >= CAPTURE_OFFSET && rx_indices[ch] < CAPTURE_OFFSET + WINDOW_SIZE) {
@@ -100,26 +94,32 @@ void removeDCBias() {
     }
 }
 
-float getGatedCenterIntegral() {
-    float area = 0;
-    for(int j = GATE_START; j <= GATE_END; j++) {
-        area += fabs(rx_buffers[2][j]); 
-    }
-    return area;
-}
-
 // ==============================================================================
-// III. CLOCK-ACCURATE FIRING CONTROL
+// III. CONTINUOUS FIRING ENGINE
 // ==============================================================================
-void IRAM_ATTR fireZeroDegreeBeam() {
+void IRAM_ATTR fireSteeredBeam(float angle_degrees) {
     uint32_t half_period = 3000; 
     uint32_t full_period = 6000; 
     uint32_t transitions[5][16];
     
+    // Calculate progressive delay to tilt the wave (0 degrees = 0 tilt)
+    float angle_rad = angle_degrees * (M_PI / 180.0);
+    int tick_step = round(3000.0 * sin(angle_rad));
+
+    int min_tick = 0;
     for(int i = 0; i < 5; i++) {
+        int raw_delay = CALIB_TX_HW_TICKS[i] + (i * tick_step);
+        if(raw_delay < min_tick) {
+            min_tick = raw_delay;
+        }
+    }
+    
+    // Assemble the perfectly synchronized firing matrix
+    for(int i = 0; i < 5; i++) {
+        int final_delay = CALIB_TX_HW_TICKS[i] + (i * tick_step) - min_tick;
         for(int p = 0; p < 8; p++) {
-            transitions[i][p*2]     = dynamic_tx_delay_ticks[i] + (p * full_period);               
-            transitions[i][p*2 + 1] = dynamic_tx_delay_ticks[i] + (p * full_period) + half_period; 
+            transitions[i][p*2]     = final_delay + (p * full_period);               
+            transitions[i][p*2 + 1] = final_delay + (p * full_period) + half_period; 
         }
     }
 
@@ -162,7 +162,8 @@ void fireBeamAndAverage(int num_shots) {
         for(int j = 0; j < WINDOW_SIZE; j++) accumulation_buffers[i][j] = 0.0f;
     }
     for(int shot = 0; shot < num_shots; shot++) {
-        fireZeroDegreeBeam();
+        // Enforcing the 0-Degree Staring Mode
+        fireSteeredBeam(0.0f); 
         recordAcousticEchoes();
         for(int i = 0; i < 5; i++) {
             for(int j = 0; j < WINDOW_SIZE; j++) accumulation_buffers[i][j] += rx_buffers[i][j];
@@ -176,7 +177,7 @@ void fireBeamAndAverage(int num_shots) {
 }
 
 // ==============================================================================
-// IV. THE PRISTINE ENGINE
+// IV. TRACK-WHILE-SCAN (TWS) LIVE LOOP
 // ==============================================================================
 void setup() {
     Serial.begin(115200); 
@@ -186,169 +187,31 @@ void setup() {
     }
     initHardwareDMA();
     
-    Serial.println("System Boot. Anti-Aliasing Auto-Tuner Initiated.");
-    delay(2000); 
+    Serial.println("System Boot. 2 MHz Target Tracking Engine Online.");
+    delay(1000); 
 }
 
 void loop() {
-    switch(currentState) {
-        
-        case TX_TICK_CLIMB: {
-            if(current_tx == 2) {
-                current_tx++; 
-                break;
+    // 3 shots to cut room noise while preserving high framerate
+    fireBeamAndAverage(3); 
+    
+    Serial.println("TWS_FRAME_START");
+    
+    // Hardware Mathematical Eraser (Direct application, no speed scaling required)
+    for(int j = 0; j < WINDOW_SIZE; j++) { 
+        for(int ch = 0; ch < 5; ch++) {
+            
+            int shift = round(CALIB_RX_HW_ERROR[ch]); 
+            int original_idx = j + shift; 
+            float val = 0.0f;
+            
+            if(original_idx >= 0 && original_idx < WINDOW_SIZE) {
+                val = rx_buffers[ch][original_idx];
             }
-
-            int center_val = dynamic_tx_delay_ticks[current_tx];
-            int test_vals[3] = {center_val - current_step_ticks, center_val, center_val + current_step_ticks};
-            float energies[3] = {0, 0, 0};
-
-            for(int i=0; i<3; i++) {
-                dynamic_tx_delay_ticks[current_tx] = test_vals[i];
-                fireBeamAndAverage(100);
-                energies[i] = getGatedCenterIntegral();
-            }
-
-            int best_idx = 1; 
-            if(energies[0] > energies[1] && energies[0] > energies[2]) best_idx = 0;
-            if(energies[2] > energies[1] && energies[2] > energies[0]) best_idx = 2;
-
-            if(best_idx != 1) {
-                dynamic_tx_delay_ticks[current_tx] = test_vals[best_idx]; 
-                array_changed = true;
-                Serial.printf("TX%d STEPPED to %d ticks (Energy: %.2f)\n", current_tx, test_vals[best_idx], energies[best_idx]);
-            } else {
-                dynamic_tx_delay_ticks[current_tx] = center_val; 
-            }
-
-            current_tx++;
-
-            if(current_tx >= 5) {
-                current_tx = 0;
-                sweep_counter++; 
-                
-                if(!array_changed || sweep_counter >= 3) { 
-                    current_step_ticks /= 2; 
-                    sweep_counter = 0; 
-                    Serial.printf("\n>>> Temporal bounds tightened. New Step: %d CPU Ticks <<<\n\n", current_step_ticks);
-                    
-                    if(current_step_ticks <= 60) { 
-                        Serial.println("===============================================================");
-                        Serial.println(">>> TX ARRAY ALIGNED TO <250 NANOSECONDS. AVOIDING NOISE PLATEAU. <<<");
-                        Serial.println("===============================================================");
-                        currentState = RX_CALIBRATE;
-                    }
-                }
-                array_changed = false; 
-            }
-            break;
+            Serial.printf("%.4f%s", val, (ch==4) ? "\n" : ",");
         }
-
-        case RX_CALIBRATE: {
-            Serial.println("\n--- COMMENCING DSP CROSS-CORRELATION PHASE ALIGNMENT ---");
-            fireBeamAndAverage(100); 
-
-            // 1. Find the gross anchor in the steady-state burst
-            int steady_start = 2240 - CAPTURE_OFFSET; 
-            int steady_end   = 2350 - CAPTURE_OFFSET; 
-            
-            float center_max = -1000.0f; 
-            int center_peak = steady_start;
-            
-            for(int j = steady_start; j <= steady_end; j++) {
-                if(rx_buffers[2][j] > center_max) {
-                    center_max = rx_buffers[2][j];
-                    center_peak = j;
-                }
-            }
-            Serial.printf("ANCHOR (RX2) Found at: %d\n", center_peak + CAPTURE_OFFSET);
-
-            // ==============================================================================
-            // UPGRADE: Sliding Cross-Correlation Engine
-            // ==============================================================================
-            int search_range = 15; // Unlocks +/- 15 indices of freedom
-            int template_start = center_peak - 25; 
-            int template_end = center_peak + 25;   
-            
-            for(int ch = 0; ch < 5; ch++) {
-                if (ch == 2) {
-                    calib_rx_hw_error[ch] = 0.0f;
-                    continue;
-                }
-                
-                float max_corr = -1000000.0f;
-                int best_shift = 0;
-                float corr_curve[31] = {0}; 
-                
-                for(int shift = -search_range; shift <= search_range; shift++) {
-                    float current_corr = 0.0f;
-                    // Slide the waveforms against each other and calculate the dot-product
-                    for(int j = template_start; j <= template_end; j++) {
-                        int ch_idx = j + shift;
-                        if(ch_idx >= 0 && ch_idx < WINDOW_SIZE) {
-                            current_corr += rx_buffers[2][j] * rx_buffers[ch][ch_idx];
-                        }
-                    }
-                    corr_curve[shift + search_range] = current_corr;
-                    
-                    if(current_corr > max_corr) {
-                        max_corr = current_corr;
-                        best_shift = shift;
-                    }
-                }
-                
-                // Extract Sub-Sample Precision directly from the Correlation Curve
-                int b_idx = best_shift + search_range;
-                float y_m1 = (b_idx > 0) ? corr_curve[b_idx - 1] : corr_curve[b_idx];
-                float y_0  = corr_curve[b_idx];
-                float y_p1 = (b_idx < 2 * search_range) ? corr_curve[b_idx + 1] : corr_curve[b_idx];
-                
-                float denom = (y_m1 - 2*y_0 + y_p1);
-                float delta = (denom != 0) ? 0.5f * (y_m1 - y_p1) / denom : 0;
-                
-                calib_rx_hw_error[ch] = (float)best_shift + delta;
-
-                Serial.printf("RX%d True DSP Lock at Shift: %.2f\n", ch, calib_rx_hw_error[ch]);
-            }
-
-            Serial.println("\n=========================================================================");
-            Serial.println(">>> PRISTINE CALIBRATION ARRAYS COMPUTED. COPY THESE INTO MEMORY. <<<");
-            Serial.println("=========================================================================\n");
-
-            int min_delay = dynamic_tx_delay_ticks[0];
-            for(int i=1; i<5; i++) if(dynamic_tx_delay_ticks[i] < min_delay) min_delay = dynamic_tx_delay_ticks[i];
-
-            Serial.print("const int CALIB_TX_HW_TICKS[5] = {");
-            for(int i=0; i<5; i++) { Serial.printf("%d%s", dynamic_tx_delay_ticks[i] - min_delay, (i<4)?", ":""); }
-            Serial.println("};\n");
-
-            Serial.print("const float CALIB_RX_HW_ERROR[5] = {");
-            for(int i=0; i<5; i++) { Serial.printf("%.4f%s", calib_rx_hw_error[i], (i<4)?", ":""); }
-            Serial.println("};\n");
-
-            Serial.println("Transmitting ALIGNED high-resolution proof graph to Python...");
-            Serial.println("START_FINAL_PLOT");
-            
-            for(int j = 0; j < WINDOW_SIZE; j++) { 
-                Serial.printf("%d,", j + CAPTURE_OFFSET);
-                for(int ch = 0; ch < 5; ch++) {
-                    int shift = round(calib_rx_hw_error[ch]);
-                    int original_idx = j + shift; 
-                    float val = 0.0f;
-                    if(original_idx >= 0 && original_idx < WINDOW_SIZE) {
-                        val = rx_buffers[ch][original_idx];
-                    }
-                    Serial.printf("%.4f%s", val, (ch==4) ? "\n" : ",");
-                }
-            }
-            Serial.println("END_FINAL_PLOT");
-            
-            currentState = DONE;
-            break;
-        }
-
-        case DONE:
-            delay(1000); 
-            break;
     }
+    
+    Serial.println("TWS_FRAME_END");
+    delay(100); 
 }
