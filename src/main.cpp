@@ -70,11 +70,11 @@ void recordAcousticEchoes() {
         
         int ch = -1;
         // The True Physical Geometric Parser (Left to Right)
-        if (p->type1.channel == ADC_CHANNEL_5) ch = 0;      // GPIO 33 (Leftmost)
-        else if (p->type1.channel == ADC_CHANNEL_4) ch = 1; // GPIO 32 (Mid-Left)
-        else if (p->type1.channel == ADC_CHANNEL_7) ch = 2; // GPIO 35 (Center)
-        else if (p->type1.channel == ADC_CHANNEL_3) ch = 3; // GPIO 39 (Mid-Right)
-        else if (p->type1.channel == ADC_CHANNEL_0) ch = 4; // GPIO 36 (Rightmost)
+        if (p->type1.channel == ADC_CHANNEL_5) ch = 0;      
+        else if (p->type1.channel == ADC_CHANNEL_4) ch = 1; 
+        else if (p->type1.channel == ADC_CHANNEL_7) ch = 2; 
+        else if (p->type1.channel == ADC_CHANNEL_3) ch = 3; 
+        else if (p->type1.channel == ADC_CHANNEL_0) ch = 4; 
 
         if (ch != -1) {
             if (rx_indices[ch] >= CAPTURE_OFFSET && rx_indices[ch] < CAPTURE_OFFSET + WINDOW_SIZE) {
@@ -102,7 +102,6 @@ void IRAM_ATTR fireSteeredBeam(float angle_degrees) {
     uint32_t full_period = 6000; 
     uint32_t transitions[5][16];
     
-    // Convert angle to radians and calculate progressive hardware delay
     float angle_rad = angle_degrees * (M_PI / 180.0);
     int tick_step = round(3000.0 * sin(angle_rad));
 
@@ -167,10 +166,7 @@ void fireBeamAndAverage(int num_shots, float target_angle) {
             for(int j = 0; j < WINDOW_SIZE; j++) accumulation_buffers[i][j] += rx_buffers[i][j];
         }
         
-        // =======================================================
         // The Acoustic Clearing Delay
-        // 40 ms allows sound to fully decay off distant walls
-        // =======================================================
         delay(40); 
     }
     for(int i = 0; i < 5; i++) {
@@ -183,6 +179,7 @@ void fireBeamAndAverage(int num_shots, float target_angle) {
 // IV. TRACK-WHILE-SCAN (TWS) LIVE LOOP
 // ==============================================================================
 void setup() {
+    // Upgraded Pipeline Speed
     Serial.begin(115200); 
     for(int i = 0; i < 5; i++) {
         pinMode(TX_TRIG[i], OUTPUT); pinMode(TX_ECHO[i], OUTPUT);
@@ -190,25 +187,22 @@ void setup() {
     }
     initHardwareDMA();
     
-    Serial.println("System Boot. 2 MHz Target Tracking Engine Online.");
+    Serial.println("System Boot. High-Speed Tracking Engine Online.");
     delay(1000); 
 }
 
 void loop() {
-    // 1. Array constrained strictly to the hardware's efficient beamwidth
     static const float scan_angles[5] = {-40.0, -20.0, 0.0, 20.0, 40.0};
     static int angle_index = 0;
     
     float current_angle = scan_angles[angle_index];
     
-    // 3 shots to cut room noise while preserving high framerate
     fireBeamAndAverage(3, current_angle); 
     
-    // Transmit the current angle to Python
     Serial.printf("TWS_FRAME_START,%.1f\n", current_angle);
     
-    // Hardware Mathematical Eraser
-    for(int j = 0; j < WINDOW_SIZE; j++) { 
+    // Hardware Mathematical Eraser & Payload Crop (50% Data Reduction)
+    for(int j = 350; j < 850; j++) { 
         for(int ch = 0; ch < 5; ch++) {
             int shift = round(CALIB_RX_HW_ERROR[ch]); 
             int original_idx = j + shift; 
@@ -223,7 +217,6 @@ void loop() {
     
     Serial.println("TWS_FRAME_END");
     
-    // 2. Modulo 5 ensures the array perfectly loops through the 5 targets
     angle_index = (angle_index + 1) % 5;
-    delay(100); 
+    // delay(10); 
 }

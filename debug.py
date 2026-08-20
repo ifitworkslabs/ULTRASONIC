@@ -7,7 +7,7 @@ from scipy.signal import hilbert
 # I. RADAR PHYSICS & RANGE CALIBRATION
 # ==========================================
 PORT = 'COM3'  # Update to your ESP32 Port
-BAUD = 115200
+BAUD = 115200  # Stable High-Speed Pipeline
 
 FREQUENCY = 40000.0          
 SPEED_OF_SOUND = 343.0       
@@ -32,13 +32,14 @@ SAMPLE_RATE_PER_CH = 400000.0
 CAPTURE_OFFSET = 1800          
 HARDWARE_DELAY_SEC = 0.0008    
 MAX_RADAR_RANGE = 1.5          
+CROP_OFFSET = 350              # Compensates for the C++ payload reduction
 
 # ==========================================
 # II. INITIALIZE HARDWARE STREAM & TACTICAL UI
 # ==========================================
 print("==================================================")
 print("Professor's Target Tracking Engine Online (2 MHz).")
-print(">>> FIRST-WAVE LEADING EDGE LOCK DEPLOYED <<<")
+print(">>> HIGH-SPEED TWS MEMORY & RANGE LOCK ACTIVE <<<")
 print("==================================================\n")
 
 try:
@@ -49,7 +50,7 @@ except Exception as e:
 
 plt.ion()
 fig = plt.figure(figsize=(16, 9))
-fig.canvas.manager.set_window_title("Phased Array 2D Command Center (Leading-Edge Memory)")
+fig.canvas.manager.set_window_title("Phased Array 2D Command Center (High-Speed Edition)")
 gs = fig.add_gridspec(2, 2, width_ratios=[1.5, 1], height_ratios=[2, 1])
 
 # --- LEFT COLUMN ---
@@ -151,12 +152,8 @@ while True:
                 stc_curve = np.linspace(STC_START_GAIN, STC_END_GAIN, num_samples_received)
                 raw_matrix = raw_matrix * stc_curve
                 
-                start_idx = 400
-                end_idx = 800
-                if num_samples_received > end_idx:
-                    signal_matrix = raw_matrix[:, start_idx:end_idx] 
-                else:
-                    signal_matrix = raw_matrix
+                # Signal matrix is now entirely pre-cropped by C++ hardware logic
+                signal_matrix = raw_matrix
                 
                 # SQUELCH GATE
                 signal_energy = np.mean(np.var(signal_matrix, axis=1))
@@ -191,7 +188,7 @@ while True:
                 spectrum[mask_outside_cone] = 0.0001
                 
                 # ==========================================================
-                # MEMORY BANK UPDATE (TARGET LOCK LOGIC)
+                # MEMORY BANK UPDATE & RANGE ALGEBRA
                 # ==========================================================
                 peak_value = np.max(spectrum)
                 if peak_value > 0.85:
@@ -199,20 +196,14 @@ while True:
                     lock_angle_deg = THETA_DEGREES[target_idx]
                     lock_angle_rad = THETA_RADIANS[target_idx]
                     
-                    # ------------------------------------------------------
-                    # NEW: THE FIRST-WAVE LEADING EDGE DISCRIMINATOR
-                    # ------------------------------------------------------
                     echo_envelope = np.sum(np.abs(raw_matrix), axis=0)
                     max_echo_val = np.max(echo_envelope)
                     
-                    # Set threshold to 25% of the absolute max to catch the true front edge
                     edge_threshold = max_echo_val * 0.25 
-                    
-                    # np.argmax on a boolean array returns the FIRST index where it is True
                     peak_time_idx = np.argmax(echo_envelope > edge_threshold)
-                    # ------------------------------------------------------
                     
-                    time_of_flight = HARDWARE_DELAY_SEC + ((CAPTURE_OFFSET + peak_time_idx) / SAMPLE_RATE_PER_CH)
+                    # Applying CROP_OFFSET to guarantee perfectly stable range measurement
+                    time_of_flight = HARDWARE_DELAY_SEC + ((CAPTURE_OFFSET + CROP_OFFSET + peak_time_idx) / SAMPLE_RATE_PER_CH)
                     lock_range_meters = (time_of_flight * SPEED_OF_SOUND) / 2.0
                     
                     target_memory[current_scan_angle] = {
@@ -226,7 +217,7 @@ while True:
                         target_memory[current_scan_angle] = None
 
                 # ==========================================
-                # DRAW MULTIPLE TARGETS FROM MEMORY
+                # DRAW PERSISTENT TARGETS
                 # ==========================================
                 active_degs, active_peaks = [], []
                 active_rads, active_ranges = [], []
@@ -250,7 +241,7 @@ while True:
                 target_mark_radar.set_data(active_rads, active_ranges)
 
                 # ==========================================
-                # UPDATE THE GREEN LINES AND UI BACKGROUNDS
+                # UI UPDATES
                 # ==========================================
                 line_music.set_ydata(spectrum)
                 if scan_patch_music is not None:
