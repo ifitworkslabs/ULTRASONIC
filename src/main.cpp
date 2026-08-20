@@ -11,7 +11,7 @@
 const int TX_TRIG[5] = {4, 14, 17, 19, 25};
 const int TX_ECHO[5] = {13, 16, 18, 23, 26};
 
-// Your dynamically extracted hardware delays
+// Dynamically extracted hardware delays
 const int CALIB_TX_HW_TICKS[5] = {600, 1680, 1320, 2040, 0};
 const float CALIB_RX_HW_ERROR[5] = {-8.2302, 7.6886, 0.0000, -7.8158, 7.6084};
 
@@ -26,7 +26,7 @@ adc_continuous_handle_t adc_handle = NULL;
 const uint32_t DMA_FLAT_BUFFER_SIZE = 30000; 
 uint8_t dma_flat_buffer[DMA_FLAT_BUFFER_SIZE] = {0};
 
-// Hardware Polling Sequence (Maintained to prevent silicon crash)
+// Hardware Polling Sequence
 const adc_channel_t RX_CHANNELS[5] = {ADC_CHANNEL_4, ADC_CHANNEL_5, ADC_CHANNEL_7, ADC_CHANNEL_0, ADC_CHANNEL_3};
 
 // ==============================================================================
@@ -102,7 +102,7 @@ void IRAM_ATTR fireSteeredBeam(float angle_degrees) {
     uint32_t full_period = 6000; 
     uint32_t transitions[5][16];
     
-    // Calculate progressive delay to tilt the wave (0 degrees = 0 tilt)
+    // Convert angle to radians and calculate progressive hardware delay
     float angle_rad = angle_degrees * (M_PI / 180.0);
     int tick_step = round(3000.0 * sin(angle_rad));
 
@@ -114,7 +114,6 @@ void IRAM_ATTR fireSteeredBeam(float angle_degrees) {
         }
     }
     
-    // Assemble the perfectly synchronized firing matrix
     for(int i = 0; i < 5; i++) {
         int final_delay = CALIB_TX_HW_TICKS[i] + (i * tick_step) - min_tick;
         for(int p = 0; p < 8; p++) {
@@ -157,18 +156,22 @@ void IRAM_ATTR fireSteeredBeam(float angle_degrees) {
     portENABLE_INTERRUPTS();
 }
 
-void fireBeamAndAverage(int num_shots) {
+void fireBeamAndAverage(int num_shots, float target_angle) {
     for(int i = 0; i < 5; i++) {
         for(int j = 0; j < WINDOW_SIZE; j++) accumulation_buffers[i][j] = 0.0f;
     }
     for(int shot = 0; shot < num_shots; shot++) {
-        // Enforcing the 0-Degree Staring Mode
-        fireSteeredBeam(0.0f); 
+        fireSteeredBeam(target_angle); 
         recordAcousticEchoes();
         for(int i = 0; i < 5; i++) {
             for(int j = 0; j < WINDOW_SIZE; j++) accumulation_buffers[i][j] += rx_buffers[i][j];
         }
-        delay(3); 
+        
+        // =======================================================
+        // The Acoustic Clearing Delay
+        // 40 ms allows sound to fully decay off distant walls
+        // =======================================================
+        delay(40); 
     }
     for(int i = 0; i < 5; i++) {
         for(int j = 0; j < WINDOW_SIZE; j++) rx_buffers[i][j] = accumulation_buffers[i][j] / (float)num_shots;
@@ -192,15 +195,21 @@ void setup() {
 }
 
 void loop() {
+    // 1. Array constrained strictly to the hardware's efficient beamwidth
+    static const float scan_angles[5] = {-40.0, -20.0, 0.0, 20.0, 40.0};
+    static int angle_index = 0;
+    
+    float current_angle = scan_angles[angle_index];
+    
     // 3 shots to cut room noise while preserving high framerate
-    fireBeamAndAverage(3); 
+    fireBeamAndAverage(3, current_angle); 
     
-    Serial.println("TWS_FRAME_START");
+    // Transmit the current angle to Python
+    Serial.printf("TWS_FRAME_START,%.1f\n", current_angle);
     
-    // Hardware Mathematical Eraser (Direct application, no speed scaling required)
+    // Hardware Mathematical Eraser
     for(int j = 0; j < WINDOW_SIZE; j++) { 
         for(int ch = 0; ch < 5; ch++) {
-            
             int shift = round(CALIB_RX_HW_ERROR[ch]); 
             int original_idx = j + shift; 
             float val = 0.0f;
@@ -213,5 +222,8 @@ void loop() {
     }
     
     Serial.println("TWS_FRAME_END");
+    
+    // 2. Modulo 5 ensures the array perfectly loops through the 5 targets
+    angle_index = (angle_index + 1) % 5;
     delay(100); 
 }
