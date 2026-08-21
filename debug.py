@@ -2,12 +2,13 @@ import serial
 import numpy as np
 import matplotlib.pyplot as plt
 from scipy.signal import hilbert
+import struct  # The magical byte-decoder
 
 # ==========================================
 # I. RADAR PHYSICS & RANGE CALIBRATION
 # ==========================================
 PORT = 'COM3'  # Update to your ESP32 Port
-BAUD = 115200  # Stable High-Speed Pipeline
+BAUD = 576000  # Stable High-Speed Pipeline
 
 FREQUENCY = 40000.0          
 SPEED_OF_SOUND = 343.0       
@@ -32,14 +33,14 @@ SAMPLE_RATE_PER_CH = 400000.0
 CAPTURE_OFFSET = 1800          
 HARDWARE_DELAY_SEC = 0.0008    
 MAX_RADAR_RANGE = 1.5          
-CROP_OFFSET = 350              # Compensates for the C++ payload reduction
+CROP_OFFSET = 350              
 
 # ==========================================
 # II. INITIALIZE HARDWARE STREAM & TACTICAL UI
 # ==========================================
 print("==================================================")
 print("Professor's Target Tracking Engine Online (2 MHz).")
-print(">>> HIGH-SPEED TWS MEMORY & RANGE LOCK ACTIVE <<<")
+print(">>> HIGH-SPEED BINARY TELEMETRY ACTIVE <<<")
 print("==================================================\n")
 
 try:
@@ -109,8 +110,6 @@ fig.patch.set_facecolor('#222222')
 plt.tight_layout()
 plt.show()
 
-recording = False
-buffer_data = []
 current_scan_angle = 0.0 
 scan_patch_music = None
 scan_patch_radar = None
@@ -119,163 +118,163 @@ target_memory = {}
 target_texts = {}
 
 # ==========================================
-# III. THE TWS EIGEN-SOLVER LOOP
+# III. THE TWS EIGEN-SOLVER LOOP (BINARY EDITION)
 # ==========================================
 while True:
     try:
-        raw_line = ser.readline()
-        if not raw_line: continue
+        # 1. The Sliding Window: Hunt for the 4-byte Sync Word
+        sync_buffer = b''
+        while True:
+            byte = ser.read(1)
+            if not byte: 
+                break
+            sync_buffer += byte
+            if len(sync_buffer) == 4:
+                if sync_buffer == b'\xaa\xbb\xcc\xdd':
+                    break
+                else:
+                    sync_buffer = sync_buffer[1:] # Drop oldest byte, keep hunting
+                    
+        if len(sync_buffer) < 4:
+            fig.canvas.draw_idle()     # Tell the UI it is time to wake up
+            fig.canvas.flush_events()  # Force the window to paint itself
+            continue # Timeout occurred
+
+        # 2. Extract the Scan Angle (1 Float = 4 Bytes)
+        angle_bytes = ser.read(4)
+        if len(angle_bytes) < 4: 
+            continue
+        current_scan_angle = struct.unpack('<f', angle_bytes)[0]
         
-        line_str = raw_line.decode('utf-8', errors='ignore').strip()
-        
-        if "TWS_FRAME_START" in line_str:
-            recording = True
-            buffer_data = []
-            try:
-                parts = line_str.split(',')
-                if len(parts) > 1:
-                    current_scan_angle = float(parts[1])
-            except ValueError:
-                pass
+        # 3. Extract the Payload (2500 Floats = 10,000 Bytes)
+        payload_bytes = ser.read(10000)
+        if len(payload_bytes) < 10000: 
             continue
             
-        if recording:
-            if "TWS_FRAME_END" in line_str:
-                recording = False
-                
-                if len(buffer_data) == 0:
-                    continue
-                
-                raw_matrix = np.array(buffer_data).T
-                num_samples_received = raw_matrix.shape[1]
-                
-                stc_curve = np.linspace(STC_START_GAIN, STC_END_GAIN, num_samples_received)
-                raw_matrix = raw_matrix * stc_curve
-                
-                # Signal matrix is now entirely pre-cropped by C++ hardware logic
-                signal_matrix = raw_matrix
-                
-                # SQUELCH GATE
-                signal_energy = np.mean(np.var(signal_matrix, axis=1))
-                NOISE_FLOOR_THRESHOLD = 0.000005 
-                
-                spectrum = np.zeros(len(THETA_RADIANS))
-                
-                if signal_energy < NOISE_FLOOR_THRESHOLD:
-                    spectrum[:] = 0.0001 
-                else:
-                    signal_matrix = signal_matrix - np.mean(signal_matrix, axis=1, keepdims=True)
-                    complex_matrix = hilbert(signal_matrix, axis=1)
-                    
-                    num_samples = complex_matrix.shape[1]
-                    Rxx = (complex_matrix @ complex_matrix.conj().T) / num_samples
-                    
-                    eigenvalues, eigenvectors = np.linalg.eigh(Rxx)
-                    idx = eigenvalues.argsort()[::-1]
-                    noise_subspace = eigenvectors[:, idx][:, 1:]
-                    
-                    for i in range(len(THETA_RADIANS)):
-                        a_theta = STEERING_VECTORS[:, i]
-                        projection = a_theta.conj().T @ noise_subspace @ noise_subspace.conj().T @ a_theta
-                        spectrum[i] = 1.0 / np.abs(projection)
-                        
-                    spectrum = spectrum / np.max(spectrum)
-                
-                # SECTOR BLANKING
-                cone_min = current_scan_angle - 10
-                cone_max = current_scan_angle + 10
-                mask_outside_cone = (THETA_DEGREES < cone_min) | (THETA_DEGREES > cone_max)
-                spectrum[mask_outside_cone] = 0.0001
-                
-                # ==========================================================
-                # MEMORY BANK UPDATE & RANGE ALGEBRA
-                # ==========================================================
-                peak_value = np.max(spectrum)
-                if peak_value > 0.85:
-                    target_idx = np.argmax(spectrum)
-                    lock_angle_deg = THETA_DEGREES[target_idx]
-                    lock_angle_rad = THETA_RADIANS[target_idx]
-                    
-                    echo_envelope = np.sum(np.abs(raw_matrix), axis=0)
-                    max_echo_val = np.max(echo_envelope)
-                    
-                    edge_threshold = max_echo_val * 0.25 
-                    peak_time_idx = np.argmax(echo_envelope > edge_threshold)
-                    
-                    # Applying CROP_OFFSET to guarantee perfectly stable range measurement
-                    time_of_flight = HARDWARE_DELAY_SEC + ((CAPTURE_OFFSET + CROP_OFFSET + peak_time_idx) / SAMPLE_RATE_PER_CH)
-                    lock_range_meters = (time_of_flight * SPEED_OF_SOUND) / 2.0
-                    
-                    target_memory[current_scan_angle] = {
-                        'deg': lock_angle_deg,
-                        'rad': lock_angle_rad,
-                        'peak': peak_value,
-                        'range': lock_range_meters
-                    }
-                else:
-                    if current_scan_angle in target_memory:
-                        target_memory[current_scan_angle] = None
+        # 4. Instant Memory Mapping
+        # Reshape directly: 500 samples per row, 5 columns -> transpose to match (5, 500)
+        flat_array = np.frombuffer(payload_bytes, dtype=np.float32)
+        raw_matrix = flat_array.reshape(500, 5).T 
 
-                # ==========================================
-                # DRAW PERSISTENT TARGETS
-                # ==========================================
-                active_degs, active_peaks = [], []
-                active_rads, active_ranges = [], []
+        num_samples_received = raw_matrix.shape[1]
+        
+        stc_curve = np.linspace(STC_START_GAIN, STC_END_GAIN, num_samples_received)
+        raw_matrix = raw_matrix * stc_curve
+        
+        signal_matrix = raw_matrix
+        
+        # SQUELCH GATE
+        signal_energy = np.mean(np.var(signal_matrix, axis=1))
+        NOISE_FLOOR_THRESHOLD = 0.000005 
+        
+        spectrum = np.zeros(len(THETA_RADIANS))
+        
+        if signal_energy < NOISE_FLOOR_THRESHOLD:
+            spectrum[:] = 0.0001 
+        else:
+            signal_matrix = signal_matrix - np.mean(signal_matrix, axis=1, keepdims=True)
+            complex_matrix = hilbert(signal_matrix, axis=1)
+            
+            num_samples = complex_matrix.shape[1]
+            Rxx = (complex_matrix @ complex_matrix.conj().T) / num_samples
+            
+            eigenvalues, eigenvectors = np.linalg.eigh(Rxx)
+            idx = eigenvalues.argsort()[::-1]
+            noise_subspace = eigenvectors[:, idx][:, 1:]
+            
+            for i in range(len(THETA_RADIANS)):
+                a_theta = STEERING_VECTORS[:, i]
+                projection = a_theta.conj().T @ noise_subspace @ noise_subspace.conj().T @ a_theta
+                spectrum[i] = 1.0 / np.abs(projection)
+                
+            spectrum = spectrum / np.max(spectrum)
+        
+        # SECTOR BLANKING
+        cone_min = current_scan_angle - 10
+        cone_max = current_scan_angle + 10
+        mask_outside_cone = (THETA_DEGREES < cone_min) | (THETA_DEGREES > cone_max)
+        spectrum[mask_outside_cone] = 0.0001
+        
+        # ==========================================================
+        # MEMORY BANK UPDATE & RANGE ALGEBRA
+        # ==========================================================
+        peak_value = np.max(spectrum)
+        if peak_value > 0.85:
+            target_idx = np.argmax(spectrum)
+            lock_angle_deg = THETA_DEGREES[target_idx]
+            lock_angle_rad = THETA_RADIANS[target_idx]
+            
+            echo_envelope = np.sum(np.abs(raw_matrix), axis=0)
+            max_echo_val = np.max(echo_envelope)
+            
+            edge_threshold = max_echo_val * 0.25 
+            peak_time_idx = np.argmax(echo_envelope > edge_threshold)
+            
+            time_of_flight = HARDWARE_DELAY_SEC + ((CAPTURE_OFFSET + CROP_OFFSET + peak_time_idx) / SAMPLE_RATE_PER_CH)
+            lock_range_meters = (time_of_flight * SPEED_OF_SOUND) / 2.0
+            
+            target_memory[current_scan_angle] = {
+                'deg': lock_angle_deg,
+                'rad': lock_angle_rad,
+                'peak': peak_value,
+                'range': lock_range_meters
+            }
+        else:
+            if current_scan_angle in target_memory:
+                target_memory[current_scan_angle] = None
 
-                for sector, data in target_memory.items():
-                    if sector not in target_texts:
-                        target_texts[sector] = ax_radar.text(0, 0, "", color='red', fontsize=12, fontweight='bold', ha='center', va='bottom', zorder=6)
+        # ==========================================
+        # DRAW PERSISTENT TARGETS
+        # ==========================================
+        active_degs, active_peaks = [], []
+        active_rads, active_ranges = [], []
 
-                    if data is not None:
-                        active_degs.append(data['deg'])
-                        active_peaks.append(data['peak'])
-                        active_rads.append(data['rad'])
-                        active_ranges.append(data['range'])
-                        
-                        target_texts[sector].set_text(f"{data['range']:.2f}m")
-                        target_texts[sector].set_position((data['rad'], data['range'] + 0.08))
-                    else:
-                        target_texts[sector].set_text("")
+        for sector, data in target_memory.items():
+            if sector not in target_texts:
+                target_texts[sector] = ax_radar.text(0, 0, "", color='red', fontsize=12, fontweight='bold', ha='center', va='bottom', zorder=6)
 
-                target_mark_music.set_data(active_degs, active_peaks)
-                target_mark_radar.set_data(active_rads, active_ranges)
-
-                # ==========================================
-                # UI UPDATES
-                # ==========================================
-                line_music.set_ydata(spectrum)
-                if scan_patch_music is not None:
-                    scan_patch_music.remove()
-                scan_patch_music = ax_music.axvspan(cone_min, cone_max, color='blue', alpha=0.15)
+            if data is not None:
+                active_degs.append(data['deg'])
+                active_peaks.append(data['peak'])
+                active_rads.append(data['rad'])
+                active_ranges.append(data['range'])
                 
-                x_axis = np.arange(num_samples_received)
-                for i in range(NUM_CHANNELS):
-                    raw_lines[i].set_data(x_axis, raw_matrix[i])
-                
-                ax_raw.set_xlim(0, num_samples_received)
-                y_min, y_max = np.min(raw_matrix), np.max(raw_matrix)
-                if y_max - y_min < 0.01:
-                    y_min, y_max = -0.1, 0.1 
-                ax_raw.set_ylim(y_min - 0.05, y_max + 0.05)
-                
-                line_radar.set_data(THETA_RADIANS, spectrum * MAX_RADAR_RANGE)
-                if scan_patch_radar is not None:
-                    scan_patch_radar.remove()
-                
-                theta_fill = np.linspace(np.radians(cone_min), np.radians(cone_max), 20)
-                scan_patch_radar = ax_radar.fill_between(theta_fill, 0, MAX_RADAR_RANGE, color='blue', alpha=0.2)
-                
-                fig.canvas.draw()
-                fig.canvas.flush_events()
-                
+                target_texts[sector].set_text(f"{data['range']:.2f}m")
+                target_texts[sector].set_position((data['rad'], data['range'] + 0.08))
             else:
-                try:
-                    vals = [float(v) for v in line_str.split(",") if v]
-                    if len(vals) == 5:
-                        buffer_data.append(vals)
-                except ValueError:
-                    pass 
+                target_texts[sector].set_text("")
 
+        target_mark_music.set_data(active_degs, active_peaks)
+        target_mark_radar.set_data(active_rads, active_ranges)
+
+        # ==========================================
+        # UI UPDATES
+        # ==========================================
+        line_music.set_ydata(spectrum)
+        if scan_patch_music is not None:
+            scan_patch_music.remove()
+        scan_patch_music = ax_music.axvspan(cone_min, cone_max, color='blue', alpha=0.15)
+        
+        x_axis = np.arange(num_samples_received)
+        for i in range(NUM_CHANNELS):
+            raw_lines[i].set_data(x_axis, raw_matrix[i])
+        
+        ax_raw.set_xlim(0, num_samples_received)
+        y_min, y_max = np.min(raw_matrix), np.max(raw_matrix)
+        if y_max - y_min < 0.01:
+            y_min, y_max = -0.1, 0.1 
+        ax_raw.set_ylim(y_min - 0.05, y_max + 0.05)
+        
+        line_radar.set_data(THETA_RADIANS, spectrum * MAX_RADAR_RANGE)
+        if scan_patch_radar is not None:
+            scan_patch_radar.remove()
+        
+        theta_fill = np.linspace(np.radians(cone_min), np.radians(cone_max), 20)
+        scan_patch_radar = ax_radar.fill_between(theta_fill, 0, MAX_RADAR_RANGE, color='blue', alpha=0.2)
+        
+        fig.canvas.draw()
+        fig.canvas.flush_events()
+                
     except KeyboardInterrupt:
         print("\n>>> TWS Engine Shutting Down.")
         ser.close()

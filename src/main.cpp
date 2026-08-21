@@ -165,8 +165,6 @@ void fireBeamAndAverage(int num_shots, float target_angle) {
         for(int i = 0; i < 5; i++) {
             for(int j = 0; j < WINDOW_SIZE; j++) accumulation_buffers[i][j] += rx_buffers[i][j];
         }
-        
-        // The Acoustic Clearing Delay
         delay(40); 
     }
     for(int i = 0; i < 5; i++) {
@@ -179,14 +177,14 @@ void fireBeamAndAverage(int num_shots, float target_angle) {
 // IV. TRACK-WHILE-SCAN (TWS) LIVE LOOP
 // ==============================================================================
 void setup() {
-    // Upgraded Pipeline Speed
-    Serial.begin(115200); 
+    Serial.begin(576000); 
     for(int i = 0; i < 5; i++) {
         pinMode(TX_TRIG[i], OUTPUT); pinMode(TX_ECHO[i], OUTPUT);
         digitalWrite(TX_TRIG[i], LOW); digitalWrite(TX_ECHO[i], LOW);
     }
     initHardwareDMA();
     
+    // We can leave this text print here because it only fires once on boot.
     Serial.println("System Boot. High-Speed Tracking Engine Online.");
     delay(1000); 
 }
@@ -196,12 +194,20 @@ void loop() {
     static int angle_index = 0;
     
     float current_angle = scan_angles[angle_index];
-    
     fireBeamAndAverage(3, current_angle); 
     
-    Serial.printf("TWS_FRAME_START,%.1f\n", current_angle);
+    // 1. TRANSMIT THE SYNC HEADER (0xAA, 0xBB, 0xCC, 0xDD)
+    const uint8_t sync_word[4] = {0xAA, 0xBB, 0xCC, 0xDD};
+    Serial.write(sync_word, 4);
     
-    // Hardware Mathematical Eraser & Payload Crop (50% Data Reduction)
+    // 2. TRANSMIT THE CURRENT TARGET ANGLE
+    Serial.write((uint8_t*)&current_angle, sizeof(float));
+    
+    // 3. PACK THE CROPPED DATA INTO A FLAT MEMORY ARRAY
+    // 500 samples (850 - 350) * 5 channels = 2500 floats.
+    static float payload[2500];
+    int idx = 0;
+    
     for(int j = 350; j < 850; j++) { 
         for(int ch = 0; ch < 5; ch++) {
             int shift = round(CALIB_RX_HW_ERROR[ch]); 
@@ -211,12 +217,12 @@ void loop() {
             if(original_idx >= 0 && original_idx < WINDOW_SIZE) {
                 val = rx_buffers[ch][original_idx];
             }
-            Serial.printf("%.4f%s", val, (ch==4) ? "\n" : ",");
+            payload[idx++] = val;
         }
     }
     
-    Serial.println("TWS_FRAME_END");
+    // 4. BLAST THE ENTIRE CHUNK OF MEMORY OVER SERIAL INSTANTLY
+    Serial.write((uint8_t*)payload, sizeof(payload));
     
     angle_index = (angle_index + 1) % 5;
-    // delay(10); 
 }
