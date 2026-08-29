@@ -1,4 +1,6 @@
 #include <Arduino.h>
+#include <WiFi.h>
+#include <WiFiUdp.h>
 #include "soc/gpio_reg.h"
 #include "esp_rom_sys.h"
 #include "esp_adc/adc_continuous.h"
@@ -6,34 +8,50 @@
 #include <math.h>
 
 // ==============================================================================
-// I. THE GOLDEN CALIBRATION KEYS (Locked at 2 MHz)
+// I. NETWORK CREDENTIALS & ZERO-CONFIG UDP
+// ==============================================================================
+const char* ssid = "LAN";         // <-- UPDATE THIS
+const char* password = "T0ixuatsac2011"; // <-- UPDATE THIS
+
+const uint16_t UDP_PORT = 8888;
+WiFiUDP udp;
+
+// Shared memory for Dual-Core Handoff
+volatile bool new_data_ready = false;
+float shared_angle = 0;
+
+// ==============================================================================
+// II. THE GOLDEN CALIBRATION KEYS
 // ==============================================================================
 const int TX_TRIG[5] = {4, 14, 17, 19, 25};
 const int TX_ECHO[5] = {13, 16, 18, 23, 26};
 
-// Dynamically extracted hardware delays
-const int CALIB_TX_HW_TICKS[5] = {600, 1680, 1320, 2040, 0};
-const float CALIB_RX_HW_ERROR[5] = {-8.2302, 7.6886, 0.0000, -7.8158, 7.6084};
+const int CALIB_TX_HW_TICKS[5] = {0, 2160, 1560, 1920, 120};
+const float CALIB_RX_HW_ERROR[5] = {-8.2058, 6.9029, 0.0000, -7.7438, 7.8892};
 
-// High-Resolution 2 MHz Windowing
 const int CAPTURE_OFFSET = 1800; 
 const int WINDOW_SIZE = 1000;    
 
 float rx_buffers[5][WINDOW_SIZE] = {0};
 float accumulation_buffers[5][WINDOW_SIZE] = {0}; 
 
+// THE MEMORY OVERLAY TRICK: 
+// By pointing shared_payload to the memory address of accumulation_buffers,
+// we recycle 10,000 bytes of "dead" RAM and prevent the compilation overflow!
+float* shared_payload = (float*)accumulation_buffers; 
+
 adc_continuous_handle_t adc_handle = NULL;
 const uint32_t DMA_FLAT_BUFFER_SIZE = 30000; 
 uint8_t dma_flat_buffer[DMA_FLAT_BUFFER_SIZE] = {0};
 
-// Hardware Polling Sequence
 const adc_channel_t RX_CHANNELS[5] = {ADC_CHANNEL_4, ADC_CHANNEL_5, ADC_CHANNEL_7, ADC_CHANNEL_0, ADC_CHANNEL_3};
 
 // ==============================================================================
-// II. HIGH-RESOLUTION DMA CORE (2 MHz)
+// III. HIGH-RESOLUTION DMA CORE (CORE 1)
 // ==============================================================================
 void initHardwareDMA() {
-    adc_continuous_handle_cfg_t adc_config = { .max_store_buf_size = 20480, .conv_frame_size = 2000 };
+    // Reduced max_store_buf_size to 10240 to save an extra 10KB of heap RAM for Wi-Fi stability
+    adc_continuous_handle_cfg_t adc_config = { .max_store_buf_size = 10240, .conv_frame_size = 2000 };
     ESP_ERROR_CHECK(adc_continuous_new_handle(&adc_config, &adc_handle));
 
     adc_continuous_config_t dig_cfg = {
@@ -69,7 +87,6 @@ void recordAcousticEchoes() {
         float volt = (float)p->type1.data / 4095.0f;
         
         int ch = -1;
-        // The True Physical Geometric Parser (Left to Right)
         if (p->type1.channel == ADC_CHANNEL_5) ch = 0;      
         else if (p->type1.channel == ADC_CHANNEL_4) ch = 1; 
         else if (p->type1.channel == ADC_CHANNEL_7) ch = 2; 
@@ -94,9 +111,6 @@ void removeDCBias() {
     }
 }
 
-// ==============================================================================
-// III. CONTINUOUS FIRING ENGINE
-// ==============================================================================
 void IRAM_ATTR fireSteeredBeam(float angle_degrees) {
     uint32_t half_period = 3000; 
     uint32_t full_period = 6000; 
@@ -108,9 +122,7 @@ void IRAM_ATTR fireSteeredBeam(float angle_degrees) {
     int min_tick = 0;
     for(int i = 0; i < 5; i++) {
         int raw_delay = CALIB_TX_HW_TICKS[i] + (i * tick_step);
-        if(raw_delay < min_tick) {
-            min_tick = raw_delay;
-        }
+        if(raw_delay < min_tick) min_tick = raw_delay;
     }
     
     for(int i = 0; i < 5; i++) {
@@ -165,7 +177,7 @@ void fireBeamAndAverage(int num_shots, float target_angle) {
         for(int i = 0; i < 5; i++) {
             for(int j = 0; j < WINDOW_SIZE; j++) accumulation_buffers[i][j] += rx_buffers[i][j];
         }
-        delay(40); 
+        delay(20); 
     }
     for(int i = 0; i < 5; i++) {
         for(int j = 0; j < WINDOW_SIZE; j++) rx_buffers[i][j] = accumulation_buffers[i][j] / (float)num_shots;
@@ -174,40 +186,75 @@ void fireBeamAndAverage(int num_shots, float target_angle) {
 }
 
 // ==============================================================================
-// IV. TRACK-WHILE-SCAN (TWS) LIVE LOOP
+// IV. THE WI-FI RADIO TASK (PINNED TO CORE 0)
+// ==============================================================================
+void udpRadioTask(void *pvParameters) {
+    while(true) {
+        if(new_data_ready) {
+            // Split the 10,000-byte HD payload into 8 chunks of 1250 bytes
+            for(uint8_t chunk = 0; chunk < 8; chunk++) {
+                udp.beginPacket("255.255.255.255", UDP_PORT);
+                
+                // 9-Byte Header: Sync(4) + Angle(4) + ChunkIndex(1)
+                uint8_t header[9];
+                header[0] = 0xAA; header[1] = 0xBB; header[2] = 0xCC; header[3] = 0xDD;
+                memcpy(&header[4], (void*)&shared_angle, 4);
+                header[8] = chunk; // 0 to 7
+                
+                udp.write(header, 9);
+                // Send exactly 1/8th of the floating-point array bytes
+                udp.write(((uint8_t*)shared_payload) + (chunk * 1250), 1250);
+                udp.endPacket();
+            }
+            new_data_ready = false;
+        }
+        vTaskDelay(pdMS_TO_TICKS(5)); 
+    }
+}
+
+// ==============================================================================
+// V. TRACK-WHILE-SCAN (TWS) LIVE LOOP
 // ==============================================================================
 void setup() {
-    Serial.begin(576000); 
+    Serial.begin(115200); 
+    
+    WiFi.mode(WIFI_STA);
+    WiFi.begin(ssid, password);
+    Serial.print("Connecting to Wi-Fi");
+    while (WiFi.status() != WL_CONNECTED) {
+        delay(500);
+        Serial.print(".");
+    }
+    Serial.println("\nWi-Fi Connected! Broadcasting on Port " + String(UDP_PORT));
+    udp.begin(UDP_PORT);
+
     for(int i = 0; i < 5; i++) {
         pinMode(TX_TRIG[i], OUTPUT); pinMode(TX_ECHO[i], OUTPUT);
         digitalWrite(TX_TRIG[i], LOW); digitalWrite(TX_ECHO[i], LOW);
     }
     initHardwareDMA();
     
-    // We can leave this text print here because it only fires once on boot.
-    Serial.println("System Boot. High-Speed Tracking Engine Online.");
-    delay(1000); 
+    // Launch the Wi-Fi Radio on Core 0 (Leaves Core 1 strictly for Radar Math)
+    xTaskCreatePinnedToCore(udpRadioTask, "UDP_Task", 4096, NULL, 1, NULL, 0);
+    
+    Serial.println("System Boot. Dual-Core HD Wi-Fi Engine Online.");
 }
 
 void loop() {
+    // Thread Safety: Wait until Core 0 finishes sending the last packet
+    while(new_data_ready) {
+        delay(1); 
+    }
+
     static const float scan_angles[5] = {-40.0, -20.0, 0.0, 20.0, 40.0};
     static int angle_index = 0;
-    
     float current_angle = scan_angles[angle_index];
+    
     fireBeamAndAverage(3, current_angle); 
     
-    // 1. TRANSMIT THE SYNC HEADER (0xAA, 0xBB, 0xCC, 0xDD)
-    const uint8_t sync_word[4] = {0xAA, 0xBB, 0xCC, 0xDD};
-    Serial.write(sync_word, 4);
+    shared_angle = current_angle;
     
-    // 2. TRANSMIT THE CURRENT TARGET ANGLE
-    Serial.write((uint8_t*)&current_angle, sizeof(float));
-    
-    // 3. PACK THE CROPPED DATA INTO A FLAT MEMORY ARRAY
-    // 500 samples (850 - 350) * 5 channels = 2500 floats.
-    static float payload[2500];
-    int idx = 0;
-    
+    int ptr = 0;
     for(int j = 350; j < 850; j++) { 
         for(int ch = 0; ch < 5; ch++) {
             int shift = round(CALIB_RX_HW_ERROR[ch]); 
@@ -217,12 +264,12 @@ void loop() {
             if(original_idx >= 0 && original_idx < WINDOW_SIZE) {
                 val = rx_buffers[ch][original_idx];
             }
-            payload[idx++] = val;
+            // Pack into the recycled memory space!
+            shared_payload[ptr++] = val; 
         }
     }
     
-    // 4. BLAST THE ENTIRE CHUNK OF MEMORY OVER SERIAL INSTANTLY
-    Serial.write((uint8_t*)payload, sizeof(payload));
-    
+    // Flag Core 0 to transmit the 8 chunks
+    new_data_ready = true;
     angle_index = (angle_index + 1) % 5;
 }
