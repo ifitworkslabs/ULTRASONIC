@@ -165,7 +165,7 @@ void fireBeamAndAverage(int num_shots, float target_angle) {
         for(int i = 0; i < 5; i++) {
             for(int j = 0; j < WINDOW_SIZE; j++) accumulation_buffers[i][j] += rx_buffers[i][j];
         }
-        delay(40); 
+        delay(40); // Keeping the acoustic wait time intact!
     }
     for(int i = 0; i < 5; i++) {
         for(int j = 0; j < WINDOW_SIZE; j++) rx_buffers[i][j] = accumulation_buffers[i][j] / (float)num_shots;
@@ -184,7 +184,6 @@ void setup() {
     }
     initHardwareDMA();
     
-    // We can leave this text print here because it only fires once on boot.
     Serial.println("System Boot. High-Speed Tracking Engine Online.");
     delay(1000); 
 }
@@ -204,8 +203,8 @@ void loop() {
     Serial.write((uint8_t*)&current_angle, sizeof(float));
     
     // 3. PACK THE CROPPED DATA INTO A FLAT MEMORY ARRAY
-    // 500 samples (850 - 350) * 5 channels = 2500 floats.
-    static float payload[2500];
+    // COMPRESSION: 500 samples (850 - 350) * 5 channels = 2500 int16s.
+    static int16_t payload[2500];
     int idx = 0;
     
     for(int j = 350; j < 850; j++) { 
@@ -217,7 +216,8 @@ void loop() {
             if(original_idx >= 0 && original_idx < WINDOW_SIZE) {
                 val = rx_buffers[ch][original_idx];
             }
-            payload[idx++] = val;
+            // Multiply to keep decimals, compress to 2 bytes
+            payload[idx++] = (int16_t)(val * 10000.0f);
         }
     }
     
