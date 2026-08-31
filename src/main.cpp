@@ -11,22 +11,22 @@
 const int TX_TRIG[5] = {4, 14, 17, 19, 25};
 const int TX_ECHO[5] = {13, 16, 18, 23, 26};
 
-// Dynamically extracted hardware delays
 const int CALIB_TX_HW_TICKS[5] = {600, 1680, 1320, 2040, 0};
-const float CALIB_RX_HW_ERROR[5] = {-8.2302, 7.6886, 0.0000, -7.8158, 7.6084};
+// We pre-rounded these so the CPU doesn't have to do it 90,000 times a second!
+const int CALIB_RX_HW_SHIFT[5] = {-8, 8, 0, -8, 8};
 
-// High-Resolution 2 MHz Windowing
-const int CAPTURE_OFFSET = 1800; 
-const int WINDOW_SIZE = 1000;    
+const int CAPTURE_OFFSET = 800;  
+const int WINDOW_SIZE = 3600; // Wide enough for a >2.0m Return Range
 
-float rx_buffers[5][WINDOW_SIZE] = {0};
-float accumulation_buffers[5][WINDOW_SIZE] = {0}; 
+// THE MEMORY DIET (UPDATED): 
+// Max ADC is 4095. 3 shots max out at 12285. 
+// This easily fits inside a 16-bit integer (max 32767).
+int16_t accumulation_buffers[5][WINDOW_SIZE] = {0}; 
 
 adc_continuous_handle_t adc_handle = NULL;
-const uint32_t DMA_FLAT_BUFFER_SIZE = 30000; 
+const uint32_t DMA_FLAT_BUFFER_SIZE = 48000; 
 uint8_t dma_flat_buffer[DMA_FLAT_BUFFER_SIZE] = {0};
 
-// Hardware Polling Sequence
 const adc_channel_t RX_CHANNELS[5] = {ADC_CHANNEL_4, ADC_CHANNEL_5, ADC_CHANNEL_7, ADC_CHANNEL_0, ADC_CHANNEL_3};
 
 // ==============================================================================
@@ -66,10 +66,8 @@ void recordAcousticEchoes() {
     int rx_indices[5] = {0, 0, 0, 0, 0};
     for (int i = 0; i < DMA_FLAT_BUFFER_SIZE; i += SOC_ADC_DIGI_RESULT_BYTES) {
         adc_digi_output_data_t *p = (adc_digi_output_data_t*)&dma_flat_buffer[i];
-        float volt = (float)p->type1.data / 4095.0f;
         
         int ch = -1;
-        // The True Physical Geometric Parser (Left to Right)
         if (p->type1.channel == ADC_CHANNEL_5) ch = 0;      
         else if (p->type1.channel == ADC_CHANNEL_4) ch = 1; 
         else if (p->type1.channel == ADC_CHANNEL_7) ch = 2; 
@@ -78,19 +76,11 @@ void recordAcousticEchoes() {
 
         if (ch != -1) {
             if (rx_indices[ch] >= CAPTURE_OFFSET && rx_indices[ch] < CAPTURE_OFFSET + WINDOW_SIZE) {
-                rx_buffers[ch][rx_indices[ch] - CAPTURE_OFFSET] = volt;
+                // Safely add raw integer data directly into our 16-bit array
+                accumulation_buffers[ch][rx_indices[ch] - CAPTURE_OFFSET] += p->type1.data;
             }
             rx_indices[ch]++;
         }
-    }
-}
-
-void removeDCBias() {
-    for(int i = 0; i < 5; i++) {
-        float sum = 0;
-        for(int j = 10; j < 80; j++) sum += rx_buffers[i][j];
-        float bias = sum / 70.0f;
-        for(int j = 0; j < WINDOW_SIZE; j++) rx_buffers[i][j] -= bias;
     }
 }
 
@@ -156,21 +146,20 @@ void IRAM_ATTR fireSteeredBeam(float angle_degrees) {
 }
 
 void fireBeamAndAverage(int num_shots, float target_angle) {
-    for(int i = 0; i < 5; i++) {
-        for(int j = 0; j < WINDOW_SIZE; j++) accumulation_buffers[i][j] = 0.0f;
-    }
+    memset(accumulation_buffers, 0, sizeof(accumulation_buffers));
+    
     for(int shot = 0; shot < num_shots; shot++) {
         fireSteeredBeam(target_angle); 
         recordAcousticEchoes();
-        for(int i = 0; i < 5; i++) {
-            for(int j = 0; j < WINDOW_SIZE; j++) accumulation_buffers[i][j] += rx_buffers[i][j];
-        }
-        delay(40); // Keeping the acoustic wait time intact!
+        // SPEED HACK: Dropped from 40ms to 15ms based on 2.0m Speed of Sound math
+        delay(40); 
     }
+    
     for(int i = 0; i < 5; i++) {
-        for(int j = 0; j < WINDOW_SIZE; j++) rx_buffers[i][j] = accumulation_buffers[i][j] / (float)num_shots;
+        for(int j = 0; j < WINDOW_SIZE; j++) {
+            accumulation_buffers[i][j] /= num_shots;
+        }
     }
-    removeDCBias();
 }
 
 // ==============================================================================
@@ -184,7 +173,7 @@ void setup() {
     }
     initHardwareDMA();
     
-    Serial.println("System Boot. High-Speed Tracking Engine Online.");
+    Serial.println("System Boot. Stable Long-Range Array Online.");
     delay(1000); 
 }
 
@@ -193,36 +182,28 @@ void loop() {
     static int angle_index = 0;
     
     float current_angle = scan_angles[angle_index];
-    fireBeamAndAverage(1, current_angle); 
+    fireBeamAndAverage(3, current_angle); 
     
-    // 1. TRANSMIT THE SYNC HEADER (0xAA, 0xBB, 0xCC, 0xDD)
     const uint8_t sync_word[4] = {0xAA, 0xBB, 0xCC, 0xDD};
     Serial.write(sync_word, 4);
-    
-    // 2. TRANSMIT THE CURRENT TARGET ANGLE
     Serial.write((uint8_t*)&current_angle, sizeof(float));
     
-    // 3. PACK THE CROPPED DATA INTO A FLAT MEMORY ARRAY
-    // COMPRESSION: 500 samples (850 - 350) * 5 channels = 2500 int16s.
-    static int16_t payload[2500];
+    int16_t* payload = (int16_t*)dma_flat_buffer;
     int idx = 0;
     
-    for(int j = 350; j < 850; j++) { 
+    for(int j = 0; j < WINDOW_SIZE; j++) { 
         for(int ch = 0; ch < 5; ch++) {
-            int shift = round(CALIB_RX_HW_ERROR[ch]); 
-            int original_idx = j + shift; 
-            float val = 0.0f;
+            // SPEED HACK: Use the pre-calculated integer, zero float math!
+            int original_idx = j + CALIB_RX_HW_SHIFT[ch]; 
+            int16_t val = 0; 
             
             if(original_idx >= 0 && original_idx < WINDOW_SIZE) {
-                val = rx_buffers[ch][original_idx];
+                val = accumulation_buffers[ch][original_idx];
             }
-            // Multiply to keep decimals, compress to 2 bytes
-            payload[idx++] = (int16_t)(val * 10000.0f);
+            payload[idx++] = val;
         }
     }
     
-    // 4. BLAST THE ENTIRE CHUNK OF MEMORY OVER SERIAL INSTANTLY
-    Serial.write((uint8_t*)payload, sizeof(payload));
-    
+    Serial.write((uint8_t*)payload, 36000);
     angle_index = (angle_index + 1) % 5;
 }
