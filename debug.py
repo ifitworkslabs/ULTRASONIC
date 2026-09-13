@@ -18,6 +18,10 @@ def serial_worker(q):
 
     while True:
         try:
+            # If the OS serial buffer fills up over time, flush it to stay strictly in real-time
+            if ser.in_waiting > 4096:
+                ser.reset_input_buffer()
+                
             # Sync to header using highly optimized PySerial C-backend
             ser.read_until(sync_pattern)
 
