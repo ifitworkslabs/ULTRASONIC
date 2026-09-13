@@ -237,7 +237,7 @@ void dspEngineTask(void *pvParameters) {
             }
             
             // If nothing loud enough, ignore
-            if (max_env < 300.0 || peak_idx < 50) {
+            if (max_env < 150.0 || peak_idx < 50) {
                 SerialPacket pkt;
                 pkt.sync[0] = 0xAA; pkt.sync[1] = 0xBB; pkt.sync[2] = 0xCC; pkt.sync[3] = 0xDD;
                 pkt.scan_angle = data.scan_angle;
@@ -357,8 +357,8 @@ void dspEngineTask(void *pvParameters) {
             float distance = (time_of_flight * SPEED_OF_SOUND) / 2.0;
 
             // MUSIC Peak thresholding (If proj_mag_sq is close to 5, denom is tiny, music_val is HUGE)
-            // music_val > 5.0 means very sharp lock
-            if (max_music_val < 5.0 || distance < 0.65 || distance > 2.0) {
+            // Lowered threshold to 1.5 to be more forgiving for off-axis targets
+            if (max_music_val < 1.5 || distance < 0.2 || distance > 3.0) {
                 distance = -1.0;
             }
 
