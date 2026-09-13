@@ -16,12 +16,14 @@ extern const float RX_X[5];
 struct CalibrationData {
     float rx_error[5]; // Mechanical delays of the receivers (seconds)
     float tx_error[5]; // Mechanical delays of the transmitters (seconds)
+    float temperature; // Temperature at time of calibration (Celsius)
+    float humidity;    // Humidity at time of calibration (%)
 };
 
 // --- FUNCTION PROTOTYPES ---
 float calculateSubSamplePeak(float y_left, float y_center, float y_right, int peak_index);
-void calibrateReceivers(float** raw_rx_buffers, int buffer_length, CalibrationData& calData, float speed_of_sound);
-void calibrateTransmitters(float** raw_rx_buffers, int buffer_length, CalibrationData& calData, float speed_of_sound);
+void calibrateReceivers(float** raw_rx_buffers, int buffer_length, CalibrationData& calData, float speed_of_sound, float temperature, float humidity);
+void calibrateTransmitters(float** raw_rx_buffers, int buffer_length, CalibrationData& calData, float speed_of_sound, float temperature, float humidity);
 void applyPhaseCorrection(float** raw_buffers, float** aligned_buffers, CalibrationData& cal, int length);
 
 #endif

@@ -4,41 +4,52 @@
 #include "esp_adc/adc_continuous.h"
 #include "hal/adc_types.h"
 #include <math.h>
+#include <Wire.h>
+#include <Adafruit_Sensor.h>
+#include <Adafruit_BME280.h>
+
+Adafruit_BME280 bme;
 
 // ==============================================================================
-// I. THE GOLDEN CALIBRATION KEYS (Locked at 2 MHz)
+// I. HARDWARE GEOMETRY & WINDOWED MEMORY ARCHITECTURE
 // ==============================================================================
 const int TX_TRIG[5] = {4, 14, 17, 19, 25};
 const int TX_ECHO[5] = {13, 16, 18, 23, 26};
 
-const int CALIB_TX_HW_TICKS[5] = {600, 1680, 1320, 2040, 0};
-// We pre-rounded these so the CPU doesn't have to do it 90,000 times a second!
-const int CALIB_RX_HW_SHIFT[5] = {-8, 8, 0, -8, 8};
+const int CAPTURE_OFFSET = 1500; 
+const int WINDOW_SIZE = 1000;    
 
-const int CAPTURE_OFFSET = 800;  
-const int WINDOW_SIZE = 3600; // Wide enough for a >2.0m Return Range
+const int GATE_START = 100;
+const int GATE_END   = 800; 
 
-// THE MEMORY DIET (UPDATED): 
-// Max ADC is 4095. 3 shots max out at 12285. 
-// This easily fits inside a 16-bit integer (max 32767).
-int16_t accumulation_buffers[5][WINDOW_SIZE] = {0}; 
+float rx_buffers[5][WINDOW_SIZE] = {0};
+float accumulation_buffers[5][WINDOW_SIZE] = {0}; 
+
+int dynamic_tx_delay_ticks[5] = {12000, 12000, 12000, 12000, 12000};
+float calib_rx_hw_error[5] = {0, 0, 0, 0, 0}; 
 
 adc_continuous_handle_t adc_handle = NULL;
-const uint32_t DMA_FLAT_BUFFER_SIZE = 48000; 
+const uint32_t DMA_FLAT_BUFFER_SIZE = 30000; 
 uint8_t dma_flat_buffer[DMA_FLAT_BUFFER_SIZE] = {0};
+const adc_channel_t RX_CHANNELS[5] = {ADC_CHANNEL_5, ADC_CHANNEL_4, ADC_CHANNEL_7, ADC_CHANNEL_3, ADC_CHANNEL_0};
 
-const adc_channel_t RX_CHANNELS[5] = {ADC_CHANNEL_4, ADC_CHANNEL_5, ADC_CHANNEL_7, ADC_CHANNEL_0, ADC_CHANNEL_3};
+enum SystemState { TX_TICK_CLIMB, RX_CALIBRATE, VERIFY_FIRE, DONE };
+SystemState currentState = TX_TICK_CLIMB;
+
+int current_step_ticks = 480; 
+bool array_changed = false;
+int current_tx = 0;
+int sweep_counter = 0; 
 
 // ==============================================================================
-// II. HIGH-RESOLUTION DMA CORE (2 MHz)
+// II. MAXIMUM FREQUENCY DMA CORE (2 MHz)
 // ==============================================================================
 void initHardwareDMA() {
     adc_continuous_handle_cfg_t adc_config = { .max_store_buf_size = 20480, .conv_frame_size = 2000 };
     ESP_ERROR_CHECK(adc_continuous_new_handle(&adc_config, &adc_handle));
 
     adc_continuous_config_t dig_cfg = {
-        .sample_freq_hz = 2000000, 
-        .conv_mode = ADC_CONV_SINGLE_UNIT_1, .format = ADC_DIGI_OUTPUT_FORMAT_TYPE1,
+        .sample_freq_hz = 2000000, .conv_mode = ADC_CONV_SINGLE_UNIT_1, .format = ADC_DIGI_OUTPUT_FORMAT_TYPE1,
     };
 
     adc_digi_pattern_config_t adc_pattern[5];
@@ -66,48 +77,53 @@ void recordAcousticEchoes() {
     int rx_indices[5] = {0, 0, 0, 0, 0};
     for (int i = 0; i < DMA_FLAT_BUFFER_SIZE; i += SOC_ADC_DIGI_RESULT_BYTES) {
         adc_digi_output_data_t *p = (adc_digi_output_data_t*)&dma_flat_buffer[i];
+        float volt = (float)p->type1.data / 4095.0f;
         
         int ch = -1;
-        if (p->type1.channel == ADC_CHANNEL_5) ch = 0;      
-        else if (p->type1.channel == ADC_CHANNEL_4) ch = 1; 
-        else if (p->type1.channel == ADC_CHANNEL_7) ch = 2; 
-        else if (p->type1.channel == ADC_CHANNEL_3) ch = 3; 
-        else if (p->type1.channel == ADC_CHANNEL_0) ch = 4; 
+        if (p->type1.channel == ADC_CHANNEL_5) ch = 0;
+        else if (p->type1.channel == ADC_CHANNEL_4) ch = 1;
+        else if (p->type1.channel == ADC_CHANNEL_7) ch = 2;
+        else if (p->type1.channel == ADC_CHANNEL_3) ch = 3;
+        else if (p->type1.channel == ADC_CHANNEL_0) ch = 4;
 
         if (ch != -1) {
             if (rx_indices[ch] >= CAPTURE_OFFSET && rx_indices[ch] < CAPTURE_OFFSET + WINDOW_SIZE) {
-                // Safely add raw integer data directly into our 16-bit array
-                accumulation_buffers[ch][rx_indices[ch] - CAPTURE_OFFSET] += p->type1.data;
+                rx_buffers[ch][rx_indices[ch] - CAPTURE_OFFSET] = volt;
             }
             rx_indices[ch]++;
         }
     }
 }
 
+void removeDCBias() {
+    for(int i = 0; i < 5; i++) {
+        float sum = 0;
+        for(int j = 10; j < 80; j++) sum += rx_buffers[i][j];
+        float bias = sum / 70.0f;
+        for(int j = 0; j < WINDOW_SIZE; j++) rx_buffers[i][j] -= bias;
+    }
+}
+
+float getGatedCenterIntegral() {
+    float area = 0;
+    for(int j = GATE_START; j <= GATE_END; j++) {
+        area += abs(rx_buffers[2][j]);
+    }
+    return area;
+}
+
 // ==============================================================================
-// III. CONTINUOUS FIRING ENGINE
+// III. CLOCK-ACCURATE FIRING CONTROL
 // ==============================================================================
-void IRAM_ATTR fireSteeredBeam(float angle_degrees) {
+void IRAM_ATTR fireZeroDegreeBeam() {
     uint32_t half_period = 3000; 
     uint32_t full_period = 6000; 
     uint32_t transitions[5][16];
     
-    float angle_rad = angle_degrees * (M_PI / 180.0);
-    int tick_step = round(3000.0 * sin(angle_rad));
-
-    int min_tick = 0;
     for(int i = 0; i < 5; i++) {
-        int raw_delay = CALIB_TX_HW_TICKS[i] + (i * tick_step);
-        if(raw_delay < min_tick) {
-            min_tick = raw_delay;
-        }
-    }
-    
-    for(int i = 0; i < 5; i++) {
-        int final_delay = CALIB_TX_HW_TICKS[i] + (i * tick_step) - min_tick;
         for(int p = 0; p < 8; p++) {
-            transitions[i][p*2]     = final_delay + (p * full_period);               
-            transitions[i][p*2 + 1] = final_delay + (p * full_period) + half_period; 
+            transitions[i][p*2]     = dynamic_tx_delay_ticks[i] + (p * full_period);               
+            transitions[i][p*2 + 1] = dynamic_tx_delay_ticks[i] + (p * full_period) + half_period; 
         }
     }
 
@@ -145,65 +161,202 @@ void IRAM_ATTR fireSteeredBeam(float angle_degrees) {
     portENABLE_INTERRUPTS();
 }
 
-void fireBeamAndAverage(int num_shots, float target_angle) {
-    memset(accumulation_buffers, 0, sizeof(accumulation_buffers));
-    
-    for(int shot = 0; shot < num_shots; shot++) {
-        fireSteeredBeam(target_angle); 
-        recordAcousticEchoes();
-        // SPEED HACK: Dropped from 40ms to 15ms based on 2.0m Speed of Sound math
-        delay(40); 
-    }
-    
+void fireBeamAndAverage(int num_shots) {
     for(int i = 0; i < 5; i++) {
-        for(int j = 0; j < WINDOW_SIZE; j++) {
-            accumulation_buffers[i][j] /= num_shots;
-        }
+        for(int j = 0; j < WINDOW_SIZE; j++) accumulation_buffers[i][j] = 0.0f;
     }
+    for(int shot = 0; shot < num_shots; shot++) {
+        fireZeroDegreeBeam();
+        recordAcousticEchoes();
+        for(int i = 0; i < 5; i++) {
+            for(int j = 0; j < WINDOW_SIZE; j++) accumulation_buffers[i][j] += rx_buffers[i][j];
+        }
+        delay(3); 
+    }
+    for(int i = 0; i < 5; i++) {
+        for(int j = 0; j < WINDOW_SIZE; j++) rx_buffers[i][j] = accumulation_buffers[i][j] / (float)num_shots;
+    }
+    removeDCBias();
 }
 
 // ==============================================================================
-// IV. TRACK-WHILE-SCAN (TWS) LIVE LOOP
+// IV. THE PRISTINE ENGINE
 // ==============================================================================
 void setup() {
-    Serial.begin(576000); 
+    Serial.begin(115200); 
     for(int i = 0; i < 5; i++) {
         pinMode(TX_TRIG[i], OUTPUT); pinMode(TX_ECHO[i], OUTPUT);
         digitalWrite(TX_TRIG[i], LOW); digitalWrite(TX_ECHO[i], LOW);
     }
+    
+    Wire.begin(21, 22);
+    if (!bme.begin(0x76, &Wire)) {
+        Serial.println("BME280 Warning: Could not find a valid sensor on 0x76 (checking 0x77...)");
+        if (!bme.begin(0x77, &Wire)) {
+            Serial.println("BME280 Warning: Could not find sensor on 0x77 either!");
+        }
+    }
+
     initHardwareDMA();
     
-    Serial.println("System Boot. Stable Long-Range Array Online.");
-    delay(1000); 
+    Serial.println("System Boot. Anti-Aliasing Auto-Tuner Initiated.");
+    delay(2000); 
 }
 
 void loop() {
-    static const float scan_angles[5] = {-40.0, -20.0, 0.0, 20.0, 40.0};
-    static int angle_index = 0;
-    
-    float current_angle = scan_angles[angle_index];
-    fireBeamAndAverage(3, current_angle); 
-    
-    const uint8_t sync_word[4] = {0xAA, 0xBB, 0xCC, 0xDD};
-    Serial.write(sync_word, 4);
-    Serial.write((uint8_t*)&current_angle, sizeof(float));
-    
-    int16_t* payload = (int16_t*)dma_flat_buffer;
-    int idx = 0;
-    
-    for(int j = 0; j < WINDOW_SIZE; j++) { 
-        for(int ch = 0; ch < 5; ch++) {
-            // SPEED HACK: Use the pre-calculated integer, zero float math!
-            int original_idx = j + CALIB_RX_HW_SHIFT[ch]; 
-            int16_t val = 0; 
-            
-            if(original_idx >= 0 && original_idx < WINDOW_SIZE) {
-                val = accumulation_buffers[ch][original_idx];
+    switch(currentState) {
+        
+        case TX_TICK_CLIMB: {
+            if(current_tx == 2) {
+                current_tx++; 
+                break;
             }
-            payload[idx++] = val;
+
+            int center_val = dynamic_tx_delay_ticks[current_tx];
+            int test_vals[3] = {center_val - current_step_ticks, center_val, center_val + current_step_ticks};
+            float energies[3] = {0, 0, 0};
+
+            for(int i=0; i<3; i++) {
+                dynamic_tx_delay_ticks[current_tx] = test_vals[i];
+                fireBeamAndAverage(100);
+                energies[i] = getGatedCenterIntegral();
+            }
+
+            int best_idx = 1; 
+            if(energies[0] > energies[1] && energies[0] > energies[2]) best_idx = 0;
+            if(energies[2] > energies[1] && energies[2] > energies[0]) best_idx = 2;
+
+            if(best_idx != 1) {
+                dynamic_tx_delay_ticks[current_tx] = test_vals[best_idx]; 
+                array_changed = true;
+                Serial.printf("TX%d STEPPED to %d ticks (Energy: %.2f)\n", current_tx, test_vals[best_idx], energies[best_idx]);
+            } else {
+                dynamic_tx_delay_ticks[current_tx] = center_val; 
+            }
+
+            current_tx++;
+
+            if(current_tx >= 5) {
+                current_tx = 0;
+                sweep_counter++; 
+                
+                if(!array_changed || sweep_counter >= 3) { 
+                    current_step_ticks /= 2; 
+                    sweep_counter = 0; 
+                    Serial.printf("\n>>> Temporal bounds tightened. New Step: %d CPU Ticks <<<\n\n", current_step_ticks);
+                    
+                    if(current_step_ticks <= 60) { 
+                        Serial.println("===============================================================");
+                        Serial.println(">>> TX ARRAY ALIGNED TO <250 NANOSECONDS. AVOIDING NOISE PLATEAU. <<<");
+                        Serial.println("===============================================================");
+                        currentState = RX_CALIBRATE;
+                    }
+                }
+                array_changed = false; 
+            }
+            break;
         }
+
+        case RX_CALIBRATE: {
+            Serial.println("\n--- COMMENCING ANTI-HOPPING RX HW DELAY EXTRACTION ---");
+            fireBeamAndAverage(100); 
+            
+            // 1. Find the true Anchor (Center Peak) ONLY in the mature Steady-State burst
+            int steady_start = 2000 - CAPTURE_OFFSET; 
+            int steady_end   = 2250 - CAPTURE_OFFSET; 
+            
+            float center_max = -1000.0f; 
+            int center_peak = steady_start;
+            
+            for(int j = steady_start; j <= steady_end; j++) {
+                if(rx_buffers[2][j] > center_max) {
+                    center_max = rx_buffers[2][j];
+                    center_peak = j;
+                }
+            }
+            Serial.printf("ANCHOR (RX2) Peak Found at 2MHz Index: %d\n", center_peak + CAPTURE_OFFSET);
+
+            int peak_indices[5] = {0, 0, center_peak, 0, 0};
+
+            // 2. Lock the window to +/- 24 indices (Half an acoustic wave!)
+            for(int ch = 0; ch < 5; ch++) {
+                if (ch == 2) continue;
+                
+                float max_val = -1000.0f;
+                int local_peak = center_peak;
+                
+                // Expanding the search bounds to catch extreme hardware delays
+                int search_start = (center_peak - 24 > 0) ? center_peak - 24 : 0;
+                int search_end = (center_peak + 24 < WINDOW_SIZE) ? center_peak + 24 : WINDOW_SIZE - 1;
+
+                for(int j = search_start; j <= search_end; j++) {
+                    if(rx_buffers[ch][j] > max_val) { 
+                        max_val = rx_buffers[ch][j];
+                        local_peak = j;
+                    }
+                }
+                peak_indices[ch] = local_peak;
+                Serial.printf("RX%d Peak Locked at 2MHz Index: %d (Hardware Error: %d)\n", ch, local_peak + CAPTURE_OFFSET, local_peak - center_peak);
+            }
+
+            for(int ch = 0; ch < 5; ch++) {
+                calib_rx_hw_error[ch] = (float)(peak_indices[ch] - peak_indices[2]);
+            }
+
+            Serial.println("\n=========================================================================");
+            Serial.println(">>> PRISTINE CALIBRATION ARRAYS COMPUTED. COPY THESE INTO MEMORY. <<<");
+            Serial.println("=========================================================================\n");
+
+            int min_delay = dynamic_tx_delay_ticks[0];
+            for(int i=1; i<5; i++) if(dynamic_tx_delay_ticks[i] < min_delay) min_delay = dynamic_tx_delay_ticks[i];
+
+            Serial.print("const int CALIB_TX_HW_TICKS[5] = {");
+            for(int i=0; i<5; i++) { Serial.printf("%d%s", dynamic_tx_delay_ticks[i] - min_delay, (i<4)?", ":""); }
+            Serial.println("};\n");
+
+            Serial.print("const float CALIB_RX_HW_ERROR[5] = {");
+            for(int i=0; i<5; i++) { Serial.printf("%.4f%s", calib_rx_hw_error[i], (i<4)?", ":""); }
+            Serial.println("};\n");
+
+            float temp = bme.readTemperature();
+            float hum = bme.readHumidity();
+            Serial.printf("BME280_TEMP: %.2f\n", temp);
+            Serial.printf("BME280_HUM: %.2f\n\n", hum);
+
+            Serial.println(">>> Auto-Tuner logic complete. Transitioning to Live Verification Fire <<<");
+            currentState = VERIFY_FIRE;
+            break;
+        }
+
+        case VERIFY_FIRE: {
+            delay(2000); // Give the air a moment to settle
+            Serial.println("\n--- COMMENCING LIVE VERIFICATION FIRE ---");
+            
+            // Fire a completely fresh acoustic burst using the optimized TX delays!
+            fireBeamAndAverage(100);
+
+            Serial.println("START_FINAL_PLOT");
+            // Dynamically shift the output array using the offsets we JUST calculated
+            for(int j = 0; j < WINDOW_SIZE; j++) { 
+                Serial.printf("%d,", j + CAPTURE_OFFSET);
+                for(int ch = 0; ch < 5; ch++) {
+                    int shift = round(calib_rx_hw_error[ch]);
+                    int original_idx = j + shift; 
+                    float val = 0.0f;
+                    if(original_idx >= 0 && original_idx < WINDOW_SIZE) {
+                        val = rx_buffers[ch][original_idx];
+                    }
+                    Serial.printf("%.4f%s", val, (ch==4) ? "\n" : ",");
+                }
+            }
+            Serial.println("END_FINAL_PLOT");
+            
+            currentState = DONE;
+            break;
+        }
+
+        case DONE:
+            delay(1000); 
+            break;
     }
-    
-    Serial.write((uint8_t*)payload, 36000);
-    angle_index = (angle_index + 1) % 5;
 }
