@@ -30,9 +30,11 @@ bool use_buffer_0 = true;
 struct RadarScanData {
     int16_t (*buffers)[WINDOW_SIZE + 40];
     float scan_angle;
+    int buf_idx;
 };
 
-QueueHandle_t dspQueue;
+QueueHandle_t freeQueue;
+QueueHandle_t fullQueue;
 
 adc_continuous_handle_t adc_handle = NULL;
 uint8_t dma_chunk_buffer[4000] = {0}; 
@@ -160,12 +162,15 @@ void recordAcousticEchoes(int16_t (*target_rx_buffers)[WINDOW_SIZE + 40]) {
 void radarEngineTask(void *pvParameters) {
     float scan_angle = -45.0;
     float scan_dir = 5.0; // Fast 5-degree step!
-    bool use_buffer_0 = true;
 
     while (1) {
+        int buf_idx;
+        // Block until a buffer is free (DSP finished with it)
+        xQueueReceive(freeQueue, &buf_idx, portMAX_DELAY);
+        
         fireSteeredBeam(scan_angle);
 
-        int16_t (*active_buffer)[WINDOW_SIZE + 40] = use_buffer_0 ? rx_buffers_0 : rx_buffers_1;
+        int16_t (*active_buffer)[WINDOW_SIZE + 40] = (buf_idx == 0) ? rx_buffers_0 : rx_buffers_1;
         
         // This blocks until DMA is done
         recordAcousticEchoes(active_buffer);
@@ -173,11 +178,10 @@ void radarEngineTask(void *pvParameters) {
         RadarScanData data;
         data.buffers = active_buffer;
         data.scan_angle = scan_angle;
+        data.buf_idx = buf_idx;
         
         // Push to DSP queue. If queue is full, we block.
-        xQueueSend(dspQueue, &data, portMAX_DELAY); 
-
-        use_buffer_0 = !use_buffer_0;
+        xQueueSend(fullQueue, &data, portMAX_DELAY); 
 
         scan_angle += scan_dir;
         if (scan_angle >= 45.0) scan_dir = -5.0;
@@ -207,7 +211,7 @@ void dspEngineTask(void *pvParameters) {
     const float WAVELENGTH = SPEED_OF_SOUND / 40000.0f;
     
     while (1) {
-        if (xQueueReceive(dspQueue, &data, portMAX_DELAY) == pdTRUE) {
+        if (xQueueReceive(fullQueue, &data, portMAX_DELAY) == pdTRUE) {
             
             // 1. Find the Echo Peak (using Center Channel 2)
             int peak_idx = -1;
@@ -237,6 +241,9 @@ void dspEngineTask(void *pvParameters) {
                 pkt.scan_angle = data.scan_angle;
                 pkt.target_angle = 0; pkt.distance = -1.0; pkt.strength = 0;
                 Serial.write((uint8_t*)&pkt, sizeof(SerialPacket));
+                
+                // Return buffer to free queue
+                xQueueSend(freeQueue, &data.buf_idx, portMAX_DELAY);
                 continue;
             }
 
@@ -362,6 +369,9 @@ void dspEngineTask(void *pvParameters) {
             pkt.strength = max_music_val;
 
             Serial.write((uint8_t*)&pkt, sizeof(SerialPacket));
+            
+            // Return buffer to free queue
+            xQueueSend(freeQueue, &data.buf_idx, portMAX_DELAY);
         }
     }
 }
@@ -374,7 +384,12 @@ void setup() {
     }
     initHardwareDMA();
 
-    dspQueue = xQueueCreate(2, sizeof(RadarScanData));
+    freeQueue = xQueueCreate(2, sizeof(int));
+    fullQueue = xQueueCreate(2, sizeof(RadarScanData));
+    
+    int b0 = 0; int b1 = 1;
+    xQueueSend(freeQueue, &b0, portMAX_DELAY);
+    xQueueSend(freeQueue, &b1, portMAX_DELAY);
 
     xTaskCreatePinnedToCore(radarEngineTask, "RadarTask", 8192, NULL, 2, NULL, 1);
     xTaskCreatePinnedToCore(dspEngineTask, "DSPTask", 32768, NULL, 1, NULL, 0);
