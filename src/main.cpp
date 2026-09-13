@@ -159,25 +159,29 @@ void recordAcousticEchoes(int16_t (*target_rx_buffers)[WINDOW_SIZE + 40]) {
 
 void radarEngineTask(void *pvParameters) {
     float scan_angle = -45.0;
-    float scan_dir = 2.0; // Fast 2-degree step!
+    float scan_dir = 5.0; // Fast 5-degree step!
+    bool use_buffer_0 = true;
 
     while (1) {
         fireSteeredBeam(scan_angle);
 
         int16_t (*active_buffer)[WINDOW_SIZE + 40] = use_buffer_0 ? rx_buffers_0 : rx_buffers_1;
+        
+        // This blocks until DMA is done
         recordAcousticEchoes(active_buffer);
 
         RadarScanData data;
         data.buffers = active_buffer;
         data.scan_angle = scan_angle;
-        // Push to DSP queue, don't block if DSP is slow (though it won't be)
-        xQueueSend(dspQueue, &data, (TickType_t)0); 
+        
+        // Push to DSP queue. If queue is full, we block.
+        xQueueSend(dspQueue, &data, portMAX_DELAY); 
 
         use_buffer_0 = !use_buffer_0;
 
         scan_angle += scan_dir;
-        if (scan_angle >= 45.0) scan_dir = -2.0;
-        if (scan_angle <= -45.0) scan_dir = 2.0;
+        if (scan_angle >= 45.0) scan_dir = -5.0;
+        if (scan_angle <= -45.0) scan_dir = 5.0;
         
         vTaskDelay(pdMS_TO_TICKS(1)); 
     }
@@ -312,7 +316,7 @@ void dspEngineTask(void *pvParameters) {
             float best_target_angle = data.scan_angle;
             float max_music_val = 0;
 
-            for(float theta = data.scan_angle - 15.0f; theta <= data.scan_angle + 15.0f; theta += 1.0f) {
+            for(float theta = data.scan_angle - 15.0f; theta <= data.scan_angle + 15.0f; theta += 0.5f) {
                 float angle_rad = theta * PI / 180.0f;
                 
                 Complex a[5];
