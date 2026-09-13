@@ -161,7 +161,7 @@ void recordAcousticEchoes(int16_t (*target_rx_buffers)[WINDOW_SIZE + 40]) {
 
 void radarEngineTask(void *pvParameters) {
     float scan_angle = -45.0;
-    float scan_dir = 5.0; // Fast 5-degree step!
+    float scan_dir = 10.0; // Ultra-fast 10-degree step!
 
     while (1) {
         int buf_idx;
@@ -184,8 +184,10 @@ void radarEngineTask(void *pvParameters) {
         xQueueSend(fullQueue, &data, portMAX_DELAY); 
 
         scan_angle += scan_dir;
-        if (scan_angle >= 45.0) scan_dir = -5.0;
-        if (scan_angle <= -45.0) scan_dir = 5.0;
+        // Flyback to -45.0 when we reach the end (sawtooth sweep pattern)
+        if (scan_angle > 45.0) {
+            scan_angle = -45.0;
+        }
         
         vTaskDelay(pdMS_TO_TICKS(1)); 
     }
