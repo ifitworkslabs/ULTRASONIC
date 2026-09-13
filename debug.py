@@ -1,141 +1,291 @@
 import serial
+import numpy as np
+from scipy.signal import hilbert
 import struct
 import multiprocessing
+import queue
 import pyqtgraph as pg
-from pyqtgraph.Qt import QtCore, QtWidgets
-import sys
-import time
-import math
+from pyqtgraph.Qt import QtCore
 
-BAUD = 576000
-PORT = 'COM3'
+# ==========================================
+# I. RADAR PHYSICS & RANGE CALIBRATION
+# ==========================================
+PORT = 'COM3'  
+BAUD = 576000  
 
-def serial_worker(q):
-    ser = serial.Serial(PORT, BAUD, timeout=1.0)
-    print("Listening to ESP32 Ultra-Fast Radar...")
+CALIB_TEMP = 30.21
+CALIB_HUM = 70.84
+SPEED_OF_SOUND = 331.4 + (0.606 * CALIB_TEMP) + (0.0124 * CALIB_HUM)
+FREQUENCY = 40000.0          
+WAVELENGTH = SPEED_OF_SOUND / FREQUENCY
+NUM_CHANNELS = 5
 
-    sync_pattern = b'\xaa\xbb\xcc\xdd'
+MIC_POSITIONS = np.array([-0.025, -0.013, -0.002, 0.009, 0.025])
+
+THETA_DEGREES = np.arange(-90, 91, 1)
+THETA_RADIANS = np.radians(THETA_DEGREES)
+
+STEERING_VECTORS = np.zeros((NUM_CHANNELS, len(THETA_RADIANS)), dtype=complex)
+for i, theta in enumerate(THETA_RADIANS):
+    spatial_phases = (MIC_POSITIONS / WAVELENGTH) * np.sin(theta)
+    STEERING_VECTORS[:, i] = np.exp(-1j * 2 * np.pi * spatial_phases)
+
+# TUNE THESE TO YOUR ROOM'S ACOUSTICS
+STC_START_GAIN = 1.0
+STC_END_GAIN = 1.0     
+STC_POWER = 1.0        
+
+# CORRECTED HARDWARE LIMITS
+SAMPLE_RATE_PER_CH = 400000.0  # TRUE ESP32 LIMIT: 2MHz total / 5 channels = 400kHz
+CAPTURE_OFFSET = 800           
+HARDWARE_DELAY_SEC = 0.0008    
+MAX_RADAR_RANGE = 2.0          
+CROP_OFFSET = 0                
+
+# THE DYNAMIC BLIND SPOT (Mutes the Screaming Transducer)
+MIN_RADAR_RANGE = 0.65         
+
+# ==========================================
+# II. CORE 1: THE DEDICATED SERIAL WORKER
+# ==========================================
+def serial_worker(port, baud, data_queue):
+    try:
+        ser = serial.Serial(port, baud, timeout=2)
+        print(">>> CORE 1: High-Speed Serial Worker Online. <<<")
+    except Exception as e:
+        print(f"CRITICAL ERROR IN WORKER: Failed to open port {port}. {e}")
+        return
 
     while True:
         try:
-            # If the OS serial buffer fills up over time, flush it to stay strictly in real-time
-            if ser.in_waiting > 4096:
+            if ser.in_waiting > 1000:
                 ser.reset_input_buffer()
-                
-            # Sync to header using highly optimized PySerial C-backend
-            ser.read_until(sync_pattern)
+            
+            sync_buffer = b''
+            while True:
+                byte = ser.read(1)
+                if not byte: break
+                sync_buffer += byte
+                if len(sync_buffer) == 4:
+                    if sync_buffer == b'\xaa\xbb\xcc\xdd':
+                        break
+                    else:
+                        sync_buffer = sync_buffer[1:]
+                        
+            if len(sync_buffer) < 4: continue 
 
-            payload = ser.read(16)
-            if len(payload) == 16:
-                scan_angle, target_angle, distance, strength = struct.unpack('<ffff', payload)
-                q.put((scan_angle, target_angle, distance, strength))
-                
+            payload_bytes = ser.read(32)
+            if len(payload_bytes) < 32: continue
+            scan_angle, temp, hum, target_range, target_x, target_y, confidence, pad = struct.unpack('<ffffffff', payload_bytes)
+            
+            data_queue.put((scan_angle, temp, hum, target_range, target_x, target_y, confidence))
+            
         except Exception as e:
-            print(f"Serial Error: {e}")
+            print(f"Serial Worker Exception: {e}")
             break
 
+# ==========================================
+# III. CORE 2: C++ ACCELERATED UI ENGINE
+# ==========================================
 if __name__ == '__main__':
-    q = multiprocessing.Queue()
-    p = multiprocessing.Process(target=serial_worker, args=(q,))
-    p.daemon = True
-    p.start()
+    print("==================================================")
+    print("Professor's Target Tracking Engine Online (2 MHz).")
+    print(">>> INSTANT VISUAL THRESHOLD PIN-LOCK ACTIVE <<<")
+    print("==================================================\n")
 
-    app = pg.mkQApp("TWS Radar")
-
-    # 1. TACTICAL MAP SETUP
-    win = pg.GraphicsLayoutWidget(show=True, title="TWS Fast Sweep")
-    win.resize(1000, 800)
-    p_radar = win.addPlot(title="2D Tactical Map")
-    p_radar.setAspectLocked(True)
-    p_radar.setXRange(-2.0, 2.0)
-    p_radar.setYRange(0, 2.5)
-    p_radar.showGrid(x=True, y=True, alpha=0.3)
-
-    # Draw Range Rings
-    for r in [0.5, 1.0, 1.5, 2.0]:
-        circle = QtWidgets.QGraphicsEllipseItem(-r, -r, r*2, r*2)
-        circle.setPen(pg.mkPen('g', width=1, style=QtCore.Qt.DashLine))
-        p_radar.addItem(circle)
-
-    # Radar Sweep Arm
-    arm_line = pg.PlotDataItem([0, 0], [0, 2.0], pen=pg.mkPen((0, 255, 0, 150), width=3))
-    p_radar.addItem(arm_line)
-
-    # Target Scatter (History/Trail)
-    target_history = []
+    data_queue = multiprocessing.Queue(maxsize=0) 
     
-    scatter_targets = pg.ScatterPlotItem(
-        size=15, 
-        pen=pg.mkPen(None), 
-        brush=pg.mkBrush(255, 0, 0, 200),
-        symbol='o'
+    worker_process = multiprocessing.Process(
+        target=serial_worker, 
+        args=(PORT, BAUD, data_queue),
+        daemon=True 
     )
-    p_radar.addItem(scatter_targets)
+    worker_process.start()
 
-    # Fading trail
-    scatter_trail = pg.ScatterPlotItem(
-        size=10, 
-        pen=pg.mkPen(None), 
-        brush=pg.mkBrush(255, 100, 100, 80),
-        symbol='o'
+    pg.setConfigOptions(antialias=True)
+    app = pg.mkQApp("Radar Engine")
+    win = pg.GraphicsLayoutWidget(show=True, title="Phased Array 2D Command Center")
+    win.resize(1400, 900)
+    win.setBackground('#111111')
+    
+    # --- ENVIRONMENT INFO ---
+    title_label = win.addLabel(
+        f"Environment Calibration | Temp: {CALIB_TEMP} °C | Hum: {CALIB_HUM} % | SoS: {SPEED_OF_SOUND:.2f} m/s",
+        row=0, col=0, colspan=2, size='14pt', color='#00FF00'
     )
-    p_radar.addItem(scatter_trail)
+
+    # --- LEFT COLUMN ---
+    p_music = win.addPlot(row=1, col=0, title="MUSIC (Spatial Spectrum)")
+    p_music.showGrid(x=True, y=True, alpha=0.3)
+    p_music.setXRange(-90, 90)
+    p_music.setYRange(0, 1.05)
+    curve_music = p_music.plot(pen=pg.mkPen('g', width=2))
+    scatter_music = pg.ScatterPlotItem(size=12, pen=pg.mkPen('w'), brush=pg.mkBrush('r'))
+    p_music.addItem(scatter_music)
+    beam_indicator_music = pg.InfiniteLine(angle=90, pen=pg.mkPen((0, 100, 255, 150), width=40))
+    p_music.addItem(beam_indicator_music)
+    
+    # 1. THE VISUAL THRESHOLD LINE
+    VISUAL_THRESHOLD = 0.65
+    thresh_line = pg.InfiniteLine(angle=0, pos=VISUAL_THRESHOLD, pen=pg.mkPen('y', width=2, style=QtCore.Qt.DashLine))
+    p_music.addItem(thresh_line)
+
+    p_raw = win.addPlot(row=2, col=0, title="RAW ADC WAVEFORMS")
+    p_raw.showGrid(x=True, y=True, alpha=0.3)
+    p_raw.setYRange(-0.1, 0.1)
+    channel_colors = [(0, 255, 255), (255, 0, 255), (255, 255, 0), (255, 0, 0), (0, 255, 0)]
+    curves_raw = [p_raw.plot(pen=pg.mkPen(color, width=1.5, alpha=200)) for color in channel_colors]
+
+    # --- RIGHT COLUMN ---
+    p_radar = win.addPlot(row=1, col=1, rowspan=2, title="2D TACTICAL MAP")
+    p_radar.setAspectLocked(True) 
+    p_radar.showGrid(x=True, y=True, alpha=0.3)
+    p_radar.setXRange(-MAX_RADAR_RANGE, MAX_RADAR_RANGE)
+    p_radar.setYRange(0, MAX_RADAR_RANGE)
+    p_radar.setLabel('bottom', 'Lateral Distance (m)')
+    p_radar.setLabel('left', 'Forward Distance (m)')
+    
+    theta_ring = np.linspace(0, 2 * np.pi, 100)
+    for r in [0.5, 1.0, 1.5, 2.0]:
+        x_ring = r * np.sin(theta_ring)
+        y_ring = r * np.cos(theta_ring)
+        p_radar.plot(x_ring, y_ring, pen=pg.mkPen((255, 255, 255, 75), width=1, style=QtCore.Qt.DashLine))
+
+    curve_radar = p_radar.plot(pen=pg.mkPen('g', width=3))
+    scatter_radar = pg.ScatterPlotItem(size=16, pen=pg.mkPen('w'), brush=pg.mkBrush('r'))
+    p_radar.addItem(scatter_radar)
+    
+    beam_cone_radar = p_radar.plot(pen=pg.mkPen((0, 100, 255, 100), width=2))
+    
+    # 2. THE TACTICAL PIN (Crosshair)
+    target_pin = p_radar.plot(pen=pg.mkPen('r', width=3))
+    pin_size = 0.15
+    
+    active_targets = []
+    target_text_items = []
 
     def update():
-        global target_history
-        
-        latest_angle = None
-
-        import queue
-        while True:
+        global SPEED_OF_SOUND, active_targets
+        while not data_queue.empty():
             try:
-                scan_angle, target_angle, distance, strength = q.get_nowait()
-                latest_angle = scan_angle
-                
-                # If distance != -1.0, we have a valid target!
-                if distance > 0:
-                    rad = math.radians(target_angle)
-                    x = distance * math.sin(rad)
-                    y = distance * math.cos(rad)
-                    
-                    # Add to history (x, y, time)
-                    target_history.append((x, y, time.time()))
+                current_scan_angle, temp, hum, target_range, target_x, target_y, confidence = data_queue.get_nowait()
             except queue.Empty:
                 break
+                
+            speed_of_sound = 331.4 + (0.606 * temp) + (0.0124 * hum)
+            SPEED_OF_SOUND = speed_of_sound
+            
+            title_label.setText(f"Environment Calibration | Temp: {temp:.2f} °C | Hum: {hum:.2f} % | SoS: {SPEED_OF_SOUND:.2f} m/s")
+                
+            cone_min = current_scan_angle - 10
+            cone_max = current_scan_angle + 10
+            
+            # =======================================================
+            # SPATIAL TARGET CLUSTERING (NMS)
+            # =======================================================
+            # Decrease TTL for all existing targets
+            for t in active_targets:
+                t['ttl'] -= 1
+            
+            # Remove dead targets
+            active_targets = [t for t in active_targets if t['ttl'] > 0]
+            
+            if confidence > VISUAL_THRESHOLD and target_range > 0:
+                lock_angle_deg = np.degrees(np.arctan2(target_x, target_y))
+                
+                # Check if this detection belongs to an existing target (within 0.3m)
+                merged = False
+                for t in active_targets:
+                    dist = np.hypot(t['tx'] - target_x, t['ty'] - target_y)
+                    if dist < 0.3:
+                        # Smooth the position and reset TTL
+                        alpha = 0.3
+                        t['tx'] = (1.0 - alpha) * t['tx'] + alpha * target_x
+                        t['ty'] = (1.0 - alpha) * t['ty'] + alpha * target_y
+                        t['range'] = (1.0 - alpha) * t['range'] + alpha * target_range
+                        t['deg'] = (1.0 - alpha) * t['deg'] + alpha * lock_angle_deg
+                        t['peak'] = max(t['peak'], confidence)
+                        t['ttl'] = 15 # stay alive for 3 full 5-angle sweeps
+                        merged = True
+                        break
+                
+                if not merged:
+                    active_targets.append({
+                        'deg': lock_angle_deg,
+                        'peak': confidence, 'range': target_range,
+                        'tx': target_x, 'ty': target_y,
+                        'ttl': 15
+                    })
+            # =======================================================
 
-        # Update Sweep Arm
-        if latest_angle is not None:
-            rad = math.radians(latest_angle)
-            arm_x = 2.5 * math.sin(rad)
-            arm_y = 2.5 * math.cos(rad)
-            arm_line.setData([0, arm_x], [0, arm_y])
+            # --- RENDER GRAPHICS ---
+            beam_indicator_music.setValue(current_scan_angle)
 
-        # Age and prune history
-        current_time = time.time()
-        # Keep dots that are less than 2.0 seconds old
-        target_history = [t for t in target_history if (current_time - t[2]) < 2.0]
+            # We can't plot raw waveforms anymore, just clear them
+            for i in range(NUM_CHANNELS):
+                curves_raw[i].setData([], [])
 
-        # Split into main targets (very recent) and trail (older)
-        main_pts = []
-        trail_pts = []
-        
-        for t in target_history:
-            age = current_time - t[2]
-            if age < 0.2:
-                main_pts.append({'pos': (t[0], t[1])})
-            else:
-                # Fade alpha based on age (0.2 to 2.0 sec)
-                alpha = max(20, int(150 * (1.0 - (age / 2.0))))
-                trail_pts.append({
-                    'pos': (t[0], t[1]),
-                    'brush': pg.mkBrush(255, 100, 100, alpha)
-                })
+            # We can't plot the full spectrum anymore, just show a peak in the cone
+            spectrum = np.ones(len(THETA_RADIANS)) * 0.0001
+            if confidence > 0:
+                # Approximate a peak
+                peak_idx = np.argmin(np.abs(THETA_DEGREES - current_scan_angle))
+                if target_range > 0:
+                    lock_angle = np.degrees(np.arctan2(target_x, target_y))
+                    peak_idx = np.argmin(np.abs(THETA_DEGREES - lock_angle))
+                spectrum[peak_idx] = confidence
+                
+            curve_music.setData(THETA_DEGREES, spectrum)
 
-        scatter_targets.setData(main_pts)
-        scatter_trail.setData(trail_pts)
+            x_radar = spectrum * MAX_RADAR_RANGE * np.sin(THETA_RADIANS)
+            y_radar = spectrum * MAX_RADAR_RANGE * np.cos(THETA_RADIANS)
+            curve_radar.setData(x_radar, y_radar)
+            
+            cone_x = [0, MAX_RADAR_RANGE * np.sin(np.radians(cone_max)), MAX_RADAR_RANGE * np.sin(np.radians(cone_min)), 0]
+            cone_y = [0, MAX_RADAR_RANGE * np.cos(np.radians(cone_max)), MAX_RADAR_RANGE * np.cos(np.radians(cone_min)), 0]
+            beam_cone_radar.setData(cone_x, cone_y)
+
+            music_pts, radar_pts = [], []
+            pin_x, pin_y = [], [] 
+            
+            # Make sure we have enough text items
+            while len(target_text_items) < len(active_targets):
+                t = pg.TextItem(text="", color=(255, 0, 0), anchor=(0.5, -0.5))
+                p_radar.addItem(t)
+                target_text_items.append(t)
+                
+            # Hide all text items initially
+            for t in target_text_items:
+                t.setText("")
+            
+            for i, data in enumerate(active_targets):
+                music_pts.append({'pos': (data['deg'], data['peak'])})
+                tx, ty = data['tx'], data['ty']
+                radar_pts.append({'pos': (tx, ty)})
+                
+                target_text_items[i].setText(f"{data['range']:.2f}m")
+                target_text_items[i].setPos(tx, ty)
+                
+                # BUILD THE TACTICAL PIN CROSSHAIR
+                pin_x.extend([
+                    tx - pin_size, tx + pin_size, np.nan,
+                    tx, tx, np.nan,
+                    tx - pin_size, tx - pin_size, tx + pin_size, tx + pin_size, tx - pin_size, np.nan
+                ])
+                pin_y.extend([
+                    ty, ty, np.nan,
+                    ty - pin_size, ty + pin_size, np.nan,
+                    ty - pin_size, ty + pin_size, ty + pin_size, ty - pin_size, ty - pin_size, np.nan
+                ])
+
+            scatter_music.setData(music_pts)
+            scatter_radar.setData(radar_pts)
+            
+            # DRAW THE PIN ON THE MAP
+            target_pin.setData(pin_x, pin_y)
 
     timer = QtCore.QTimer()
     timer.timeout.connect(update)
-    timer.start(30) # ~33fps UI update to prevent Qt rendering lag
+    timer.start(0) 
 
     pg.exec()

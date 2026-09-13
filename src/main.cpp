@@ -5,46 +5,40 @@
 #include "hal/adc_types.h"
 #include <math.h>
 
+// ==============================================================================
+// I. THE GOLDEN CALIBRATION KEYS (Locked at 2 MHz)
+// ==============================================================================
 const int TX_TRIG[5] = {4, 14, 17, 19, 25};
 const int TX_ECHO[5] = {13, 16, 18, 23, 26};
-const adc_channel_t RX_CHANNELS[5] = {ADC_CHANNEL_5, ADC_CHANNEL_4, ADC_CHANNEL_7, ADC_CHANNEL_3, ADC_CHANNEL_0};
 
-// === 1. CALIBRATED HARDWARE CONSTANTS ===
-const int CALIB_TX_HW_TICKS[5] = {120, 1680, 1200, 2280, 0};
-const int CALIB_RX_HW_ERROR[5] = {-16, 16, 0, -16, 8};
+const int CALIB_TX_HW_TICKS[5] = {600, 1680, 1320, 2040, 0};
+// We pre-rounded these so the CPU doesn't have to do it 90,000 times a second!
+const int CALIB_RX_HW_SHIFT[5] = {-8, 8, 0, -8, 8};
 
-// === 2. ENVIRONMENTAL PHYSICS ===
-const float SPEED_OF_SOUND = 350.48; 
-const float TX_POSITIONS[5] = {-0.0084, -0.0042, 0.0000, 0.0042, 0.0084}; // in meters
-const float RX_POSITIONS[5] = {-0.025, -0.013, -0.002, 0.009, 0.025}; // in meters
+const int CAPTURE_OFFSET = 800;  
+const int WINDOW_SIZE = 3600; // Wide enough for a >2.0m Return Range
 
-// === 3. RADAR ENGINE CONFIG ===
-const int CAPTURE_OFFSET = 800; // 800 samples = 2ms delay
-const int WINDOW_SIZE = 3600;   
-const float SAMPLE_RATE = 400000.0; 
-
-int16_t rx_buffers_0[5][WINDOW_SIZE + 40] = {0};
-int16_t rx_buffers_1[5][WINDOW_SIZE + 40] = {0};
-bool use_buffer_0 = true;
-
-struct RadarScanData {
-    int16_t (*buffers)[WINDOW_SIZE + 40];
-    float scan_angle;
-    int buf_idx;
-};
-
-QueueHandle_t freeQueue;
-QueueHandle_t fullQueue;
+// THE MEMORY DIET (UPDATED): 
+// Max ADC is 4095. 3 shots max out at 12285. 
+// This easily fits inside a 16-bit integer (max 32767).
+int16_t accumulation_buffers[5][WINDOW_SIZE] = {0}; 
 
 adc_continuous_handle_t adc_handle = NULL;
-uint8_t dma_chunk_buffer[4000] = {0}; 
+const uint32_t DMA_FLAT_BUFFER_SIZE = 48000; 
+uint8_t dma_flat_buffer[DMA_FLAT_BUFFER_SIZE] = {0};
 
+const adc_channel_t RX_CHANNELS[5] = {ADC_CHANNEL_4, ADC_CHANNEL_5, ADC_CHANNEL_7, ADC_CHANNEL_0, ADC_CHANNEL_3};
+
+// ==============================================================================
+// II. HIGH-RESOLUTION DMA CORE (2 MHz)
+// ==============================================================================
 void initHardwareDMA() {
-    adc_continuous_handle_cfg_t adc_config = { .max_store_buf_size = 30000, .conv_frame_size = 2000 };
+    adc_continuous_handle_cfg_t adc_config = { .max_store_buf_size = 20480, .conv_frame_size = 2000 };
     ESP_ERROR_CHECK(adc_continuous_new_handle(&adc_config, &adc_handle));
 
     adc_continuous_config_t dig_cfg = {
-        .sample_freq_hz = 2000000, .conv_mode = ADC_CONV_SINGLE_UNIT_1, .format = ADC_DIGI_OUTPUT_FORMAT_TYPE1,
+        .sample_freq_hz = 2000000, 
+        .conv_mode = ADC_CONV_SINGLE_UNIT_1, .format = ADC_DIGI_OUTPUT_FORMAT_TYPE1,
     };
 
     adc_digi_pattern_config_t adc_pattern[5];
@@ -58,30 +52,62 @@ void initHardwareDMA() {
     ESP_ERROR_CHECK(adc_continuous_config(adc_handle, &dig_cfg));
 }
 
-void IRAM_ATTR fireSteeredBeam(float angle_deg) {
-    float angle_rad = angle_deg * PI / 180.0f;
-    
-    int delays[5];
-    for(int i=0; i<5; i++) {
-        float delta_t = (TX_POSITIONS[i] * sin(angle_rad)) / SPEED_OF_SOUND;
-        delays[i] = (int)(delta_t * 240000000.0f);
+void recordAcousticEchoes() {
+    ESP_ERROR_CHECK(adc_continuous_start(adc_handle));
+    uint32_t total_bytes_read = 0;
+    while (total_bytes_read < DMA_FLAT_BUFFER_SIZE) {
+        uint32_t bytes_chunk = 0;
+        if (adc_continuous_read(adc_handle, dma_flat_buffer + total_bytes_read, DMA_FLAT_BUFFER_SIZE - total_bytes_read, &bytes_chunk, ADC_MAX_DELAY) == ESP_OK) {
+            total_bytes_read += bytes_chunk;
+        }
     }
-    
-    int min_d = delays[0];
-    for(int i=1; i<5; i++) if(delays[i] < min_d) min_d = delays[i];
-    
-    for(int i=0; i<5; i++) {
-        delays[i] = delays[i] - min_d + CALIB_TX_HW_TICKS[i];
+    ESP_ERROR_CHECK(adc_continuous_stop(adc_handle));
+
+    int rx_indices[5] = {0, 0, 0, 0, 0};
+    for (int i = 0; i < DMA_FLAT_BUFFER_SIZE; i += SOC_ADC_DIGI_RESULT_BYTES) {
+        adc_digi_output_data_t *p = (adc_digi_output_data_t*)&dma_flat_buffer[i];
+        
+        int ch = -1;
+        if (p->type1.channel == ADC_CHANNEL_5) ch = 0;      
+        else if (p->type1.channel == ADC_CHANNEL_4) ch = 1; 
+        else if (p->type1.channel == ADC_CHANNEL_7) ch = 2; 
+        else if (p->type1.channel == ADC_CHANNEL_3) ch = 3; 
+        else if (p->type1.channel == ADC_CHANNEL_0) ch = 4; 
+
+        if (ch != -1) {
+            if (rx_indices[ch] >= CAPTURE_OFFSET && rx_indices[ch] < CAPTURE_OFFSET + WINDOW_SIZE) {
+                // Safely add raw integer data directly into our 16-bit array
+                accumulation_buffers[ch][rx_indices[ch] - CAPTURE_OFFSET] += p->type1.data;
+            }
+            rx_indices[ch]++;
+        }
     }
-    
+}
+
+// ==============================================================================
+// III. CONTINUOUS FIRING ENGINE
+// ==============================================================================
+void IRAM_ATTR fireSteeredBeam(float angle_degrees) {
     uint32_t half_period = 3000; 
     uint32_t full_period = 6000; 
     uint32_t transitions[5][16];
     
+    float angle_rad = angle_degrees * (M_PI / 180.0);
+    int tick_step = round(3000.0 * sin(angle_rad));
+
+    int min_tick = 0;
     for(int i = 0; i < 5; i++) {
+        int raw_delay = CALIB_TX_HW_TICKS[i] + (i * tick_step);
+        if(raw_delay < min_tick) {
+            min_tick = raw_delay;
+        }
+    }
+    
+    for(int i = 0; i < 5; i++) {
+        int final_delay = CALIB_TX_HW_TICKS[i] + (i * tick_step) - min_tick;
         for(int p = 0; p < 8; p++) {
-            transitions[i][p*2]     = delays[i] + (p * full_period);               
-            transitions[i][p*2 + 1] = delays[i] + (p * full_period) + half_period; 
+            transitions[i][p*2]     = final_delay + (p * full_period);               
+            transitions[i][p*2 + 1] = final_delay + (p * full_period) + half_period; 
         }
     }
 
@@ -119,265 +145,26 @@ void IRAM_ATTR fireSteeredBeam(float angle_deg) {
     portENABLE_INTERRUPTS();
 }
 
-void recordAcousticEchoes(int16_t (*target_rx_buffers)[WINDOW_SIZE + 40]) {
-    ESP_ERROR_CHECK(adc_continuous_start(adc_handle));
-
-    int rx_indices[5] = {0, 0, 0, 0, 0};
-    bool done = false;
+void fireBeamAndAverage(int num_shots, float target_angle) {
+    memset(accumulation_buffers, 0, sizeof(accumulation_buffers));
     
-    while (!done) {
-        uint32_t bytes_chunk = 0;
-        if (adc_continuous_read(adc_handle, dma_chunk_buffer, sizeof(dma_chunk_buffer), &bytes_chunk, ADC_MAX_DELAY) == ESP_OK) {
-            for (int i = 0; i < bytes_chunk; i += SOC_ADC_DIGI_RESULT_BYTES) {
-                adc_digi_output_data_t *p = (adc_digi_output_data_t*)&dma_chunk_buffer[i];
-                int16_t val = (int16_t)p->type1.data;
-                
-                int ch = -1;
-                if (p->type1.channel == ADC_CHANNEL_5) ch = 0;
-                else if (p->type1.channel == ADC_CHANNEL_4) ch = 1;
-                else if (p->type1.channel == ADC_CHANNEL_7) ch = 2;
-                else if (p->type1.channel == ADC_CHANNEL_3) ch = 3;
-                else if (p->type1.channel == ADC_CHANNEL_0) ch = 4;
-
-                if (ch != -1) {
-                    if (rx_indices[ch] >= CAPTURE_OFFSET && rx_indices[ch] < CAPTURE_OFFSET + WINDOW_SIZE + 40) {
-                        target_rx_buffers[ch][rx_indices[ch] - CAPTURE_OFFSET] = val;
-                    }
-                    rx_indices[ch]++;
-                }
-            }
-        }
-        
-        done = true;
-        for(int ch=0; ch<5; ch++) {
-            if(rx_indices[ch] < CAPTURE_OFFSET + WINDOW_SIZE + 40) {
-                done = false;
-                break;
-            }
-        }
+    for(int shot = 0; shot < num_shots; shot++) {
+        fireSteeredBeam(target_angle); 
+        recordAcousticEchoes();
+        // SPEED HACK: Dropped from 40ms to 15ms based on 2.0m Speed of Sound math
+        delay(40); 
     }
-    ESP_ERROR_CHECK(adc_continuous_stop(adc_handle));
-}
-
-void radarEngineTask(void *pvParameters) {
-    float scan_angle = -45.0;
-    float scan_dir = 10.0; // Ultra-fast 10-degree step!
-
-    while (1) {
-        int buf_idx;
-        // Block until a buffer is free (DSP finished with it)
-        xQueueReceive(freeQueue, &buf_idx, portMAX_DELAY);
-        
-        fireSteeredBeam(scan_angle);
-
-        int16_t (*active_buffer)[WINDOW_SIZE + 40] = (buf_idx == 0) ? rx_buffers_0 : rx_buffers_1;
-        
-        // This blocks until DMA is done
-        recordAcousticEchoes(active_buffer);
-
-        RadarScanData data;
-        data.buffers = active_buffer;
-        data.scan_angle = scan_angle;
-        data.buf_idx = buf_idx;
-        
-        // Push to DSP queue. If queue is full, we block.
-        xQueueSend(fullQueue, &data, portMAX_DELAY); 
-
-        scan_angle += scan_dir;
-        // Flyback to -45.0 when we reach the end (sawtooth sweep pattern)
-        if (scan_angle > 45.0) {
-            scan_angle = -45.0;
-        }
-        
-        vTaskDelay(pdMS_TO_TICKS(1)); 
-    }
-}
-
-#pragma pack(push, 1)
-struct SerialPacket {
-    uint8_t sync[4];
-    float scan_angle;
-    float target_angle;
-    float distance;
-    float strength;
-};
-#pragma pack(pop)
-
-void dspEngineTask(void *pvParameters) {
-    RadarScanData data;
     
-    // Tuning parameters
-    float STC_START_GAIN = 1.0;
-    float STC_END_GAIN = 5.0;
-    float STC_POWER = 2.5;
-    const float WAVELENGTH = SPEED_OF_SOUND / 40000.0f;
-    
-    while (1) {
-        if (xQueueReceive(fullQueue, &data, portMAX_DELAY) == pdTRUE) {
-            
-            // 1. Find the Echo Peak (using Center Channel 2)
-            int peak_idx = -1;
-            float max_env = 0;
-            
-            // Remove DC offset for Center Channel
-            long dc_sum = 0;
-            for(int j=0; j<100; j++) dc_sum += data.buffers[2][j+20];
-            float dc_offset = (float)dc_sum / 100.0f;
-
-            for (int j = 0; j < WINDOW_SIZE; j++) {
-                float val = (float)data.buffers[2][j + 20] - dc_offset;
-                float env = abs(val);
-                float t_ratio = (float)j / (float)WINDOW_SIZE;
-                float stc = STC_START_GAIN + (STC_END_GAIN - STC_START_GAIN) * pow(t_ratio, STC_POWER);
-                env *= stc;
-                if (env > max_env) {
-                    max_env = env;
-                    peak_idx = j;
-                }
-            }
-            
-            // If nothing loud enough, ignore
-            if (max_env < 150.0 || peak_idx < 50) {
-                SerialPacket pkt;
-                pkt.sync[0] = 0xAA; pkt.sync[1] = 0xBB; pkt.sync[2] = 0xCC; pkt.sync[3] = 0xDD;
-                pkt.scan_angle = data.scan_angle;
-                pkt.target_angle = 0; pkt.distance = -1.0; pkt.strength = 0;
-                Serial.write((uint8_t*)&pkt, sizeof(SerialPacket));
-                
-                // Return buffer to free queue
-                xQueueSend(freeQueue, &data.buf_idx, portMAX_DELAY);
-                continue;
-            }
-
-            // 2. Extract 100-sample window and IQ Demodulate
-            int start_idx = peak_idx - 30;
-            if(start_idx < 0) start_idx = 0;
-            if(start_idx > WINDOW_SIZE - 100) start_idx = WINDOW_SIZE - 100;
-
-            struct Complex { float r; float i; };
-            Complex X[5][100];
-            
-            for(int ch = 0; ch < 5; ch++) {
-                // Find DC for this channel
-                long sum = 0;
-                for(int j=0; j<100; j++) sum += data.buffers[ch][j+20];
-                float ch_dc = (float)sum / 100.0f;
-
-                for(int k = 0; k < 100; k++) {
-                    int idx = start_idx + k + CALIB_RX_HW_ERROR[ch] + 20;
-                    if(idx < 0) idx = 0;
-                    if(idx >= WINDOW_SIZE + 40) idx = WINDOW_SIZE + 39;
-                    
-                    float val = (float)data.buffers[ch][idx] - ch_dc;
-                    // 40kHz at 400kHz SR = 10 samples per period
-                    float angle = 2.0 * PI * (float)(k % 10) / 10.0;
-                    X[ch][k].r = val * cos(angle);
-                    X[ch][k].i = -val * sin(angle);
-                }
-            }
-
-            // Low-pass filter (Moving Average over 10 samples)
-            Complex X_lpf[5][90];
-            for(int ch = 0; ch < 5; ch++) {
-                for(int k = 0; k < 90; k++) {
-                    float sum_r = 0, sum_i = 0;
-                    for(int m = 0; m < 10; m++) {
-                        sum_r += X[ch][k+m].r;
-                        sum_i += X[ch][k+m].i;
-                    }
-                    X_lpf[ch][k].r = sum_r / 10.0f;
-                    X_lpf[ch][k].i = sum_i / 10.0f;
-                }
-            }
-
-            // 3. Covariance Matrix (5x5)
-            Complex R[5][5];
-            for(int i=0; i<5; i++) {
-                for(int j=0; j<5; j++) {
-                    R[i][j].r = 0; R[i][j].i = 0;
-                    for(int k=0; k<90; k++) {
-                        R[i][j].r += X_lpf[i][k].r * X_lpf[j][k].r + X_lpf[i][k].i * X_lpf[j][k].i;
-                        R[i][j].i += X_lpf[i][k].i * X_lpf[j][k].r - X_lpf[i][k].r * X_lpf[j][k].i;
-                    }
-                }
-            }
-
-            // 4. Power Iteration for Principal Eigenvector
-            Complex v[5] = {{1,0}, {1,0}, {1,0}, {1,0}, {1,0}};
-            for(int iter=0; iter<10; iter++) {
-                Complex v_new[5] = {0};
-                for(int i=0; i<5; i++) {
-                    for(int j=0; j<5; j++) {
-                        v_new[i].r += R[i][j].r * v[j].r - R[i][j].i * v[j].i;
-                        v_new[i].i += R[i][j].r * v[j].i + R[i][j].i * v[j].r;
-                    }
-                }
-                float norm_sq = 0;
-                for(int i=0; i<5; i++) norm_sq += v_new[i].r*v_new[i].r + v_new[i].i*v_new[i].i;
-                float norm = sqrt(norm_sq);
-                for(int i=0; i<5; i++) {
-                    v[i].r = v_new[i].r / norm;
-                    v[i].i = v_new[i].i / norm;
-                }
-            }
-
-            // 5. MUSIC Spectrum Search
-            float best_target_angle = data.scan_angle;
-            float max_music_val = 0;
-
-            for(float theta = data.scan_angle - 15.0f; theta <= data.scan_angle + 15.0f; theta += 0.5f) {
-                float angle_rad = theta * PI / 180.0f;
-                
-                Complex a[5];
-                for(int i=0; i<5; i++) {
-                    float phase = 2.0f * PI * (RX_POSITIONS[i] * sin(angle_rad)) / WAVELENGTH;
-                    a[i].r = cos(phase);
-                    a[i].i = sin(phase);
-                }
-                
-                float proj_r = 0; float proj_i = 0;
-                for(int i=0; i<5; i++) {
-                    proj_r += a[i].r * v[i].r + a[i].i * v[i].i;
-                    proj_i += a[i].r * v[i].i - a[i].i * v[i].r;
-                }
-                
-                float proj_mag_sq = proj_r*proj_r + proj_i*proj_i;
-                float denom = 5.0f - proj_mag_sq;
-                if(denom < 0.0001f) denom = 0.0001f;
-                float music_val = 1.0f / denom;
-                
-                if(music_val > max_music_val) {
-                    max_music_val = music_val;
-                    best_target_angle = theta;
-                }
-            }
-
-            // 6. Calculate Distance and Threshold
-            float time_of_flight = 0.0008 + ((CAPTURE_OFFSET + peak_idx) / SAMPLE_RATE);
-            float distance = (time_of_flight * SPEED_OF_SOUND) / 2.0;
-
-            // MUSIC Peak thresholding (If proj_mag_sq is close to 5, denom is tiny, music_val is HUGE)
-            // Lowered threshold to 1.5 to be more forgiving for off-axis targets
-            if (max_music_val < 1.5 || distance < 0.2 || distance > 3.0) {
-                distance = -1.0;
-            }
-
-            // 7. Output Packet
-            SerialPacket pkt;
-            pkt.sync[0] = 0xAA; pkt.sync[1] = 0xBB; pkt.sync[2] = 0xCC; pkt.sync[3] = 0xDD;
-            pkt.scan_angle = data.scan_angle;
-            pkt.target_angle = best_target_angle;
-            pkt.distance = distance;
-            pkt.strength = max_music_val;
-
-            Serial.write((uint8_t*)&pkt, sizeof(SerialPacket));
-            
-            // Return buffer to free queue
-            xQueueSend(freeQueue, &data.buf_idx, portMAX_DELAY);
+    for(int i = 0; i < 5; i++) {
+        for(int j = 0; j < WINDOW_SIZE; j++) {
+            accumulation_buffers[i][j] /= num_shots;
         }
     }
 }
 
+// ==============================================================================
+// IV. TRACK-WHILE-SCAN (TWS) LIVE LOOP
+// ==============================================================================
 void setup() {
     Serial.begin(576000); 
     for(int i = 0; i < 5; i++) {
@@ -385,18 +172,38 @@ void setup() {
         digitalWrite(TX_TRIG[i], LOW); digitalWrite(TX_ECHO[i], LOW);
     }
     initHardwareDMA();
-
-    freeQueue = xQueueCreate(2, sizeof(int));
-    fullQueue = xQueueCreate(2, sizeof(RadarScanData));
     
-    int b0 = 0; int b1 = 1;
-    xQueueSend(freeQueue, &b0, portMAX_DELAY);
-    xQueueSend(freeQueue, &b1, portMAX_DELAY);
-
-    xTaskCreatePinnedToCore(radarEngineTask, "RadarTask", 8192, NULL, 2, NULL, 1);
-    xTaskCreatePinnedToCore(dspEngineTask, "DSPTask", 32768, NULL, 1, NULL, 0);
+    Serial.println("System Boot. Stable Long-Range Array Online.");
+    delay(1000); 
 }
 
 void loop() {
-    vTaskDelay(pdMS_TO_TICKS(1000));
+    static const float scan_angles[5] = {-40.0, -20.0, 0.0, 20.0, 40.0};
+    static int angle_index = 0;
+    
+    float current_angle = scan_angles[angle_index];
+    fireBeamAndAverage(3, current_angle); 
+    
+    const uint8_t sync_word[4] = {0xAA, 0xBB, 0xCC, 0xDD};
+    Serial.write(sync_word, 4);
+    Serial.write((uint8_t*)&current_angle, sizeof(float));
+    
+    int16_t* payload = (int16_t*)dma_flat_buffer;
+    int idx = 0;
+    
+    for(int j = 0; j < WINDOW_SIZE; j++) { 
+        for(int ch = 0; ch < 5; ch++) {
+            // SPEED HACK: Use the pre-calculated integer, zero float math!
+            int original_idx = j + CALIB_RX_HW_SHIFT[ch]; 
+            int16_t val = 0; 
+            
+            if(original_idx >= 0 && original_idx < WINDOW_SIZE) {
+                val = accumulation_buffers[ch][original_idx];
+            }
+            payload[idx++] = val;
+        }
+    }
+    
+    Serial.write((uint8_t*)payload, 36000);
+    angle_index = (angle_index + 1) % 5;
 }
