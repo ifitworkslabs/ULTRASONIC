@@ -16,7 +16,6 @@ def serial_worker(q):
 
     sync_pattern = b'\xaa\xbb\xcc\xdd'
 
-    batch = []
     while True:
         try:
             # Sync to header using highly optimized PySerial C-backend
@@ -25,12 +24,7 @@ def serial_worker(q):
             payload = ser.read(16)
             if len(payload) == 16:
                 scan_angle, target_angle, distance, strength = struct.unpack('<ffff', payload)
-                batch.append((scan_angle, target_angle, distance, strength))
-                
-                # Send data in batches to drastically reduce multiprocessing IPC overhead
-                if len(batch) >= 10:
-                    q.put(batch)
-                    batch = []
+                q.put((scan_angle, target_angle, distance, strength))
                 
         except Exception as e:
             print(f"Serial Error: {e}")
@@ -91,18 +85,17 @@ if __name__ == '__main__':
         import queue
         while True:
             try:
-                batch = q.get_nowait()
-                for scan_angle, target_angle, distance, strength in batch:
-                    latest_angle = scan_angle
+                scan_angle, target_angle, distance, strength = q.get_nowait()
+                latest_angle = scan_angle
+                
+                # If distance != -1.0, we have a valid target!
+                if distance > 0:
+                    rad = math.radians(target_angle)
+                    x = distance * math.sin(rad)
+                    y = distance * math.cos(rad)
                     
-                    # If distance != -1.0, we have a valid target!
-                    if distance > 0:
-                        rad = math.radians(target_angle)
-                        x = distance * math.sin(rad)
-                        y = distance * math.cos(rad)
-                        
-                        # Add to history (x, y, time)
-                        target_history.append((x, y, time.time()))
+                    # Add to history (x, y, time)
+                    target_history.append((x, y, time.time()))
             except queue.Empty:
                 break
 
