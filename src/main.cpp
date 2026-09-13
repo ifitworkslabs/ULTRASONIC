@@ -4,9 +4,6 @@
 #include "esp_adc/adc_continuous.h"
 #include "hal/adc_types.h"
 #include <math.h>
-#include <Wire.h>
-#include <Adafruit_Sensor.h>
-#include <Adafruit_BME280.h>
 
 const int TX_TRIG[5] = {4, 14, 17, 19, 25};
 const int TX_ECHO[5] = {13, 16, 18, 23, 26};
@@ -17,19 +14,28 @@ const int CALIB_TX_HW_TICKS[5] = {120, 1680, 1200, 2280, 0};
 const int CALIB_RX_HW_ERROR[5] = {-16, 16, 0, -16, 8};
 
 // === 2. ENVIRONMENTAL PHYSICS ===
-// Based on T=30.21C, H=70.84%
 const float SPEED_OF_SOUND = 350.48; 
-const float TX_POSITIONS[5] = {-0.0084, -0.0042, 0.0000, 0.0042, 0.0084}; // in meters (4.2mm apart)
+const float TX_POSITIONS[5] = {-0.0084, -0.0042, 0.0000, 0.0042, 0.0084}; // in meters
+const float RX_POSITIONS[5] = {-0.025, -0.013, -0.002, 0.009, 0.025}; // in meters
 
 // === 3. RADAR ENGINE CONFIG ===
-const int CAPTURE_OFFSET = 800; // Match debug.py
-const int WINDOW_SIZE = 3600;   // Match debug.py (3600 samples)
+const int CAPTURE_OFFSET = 800; // 800 samples = 2ms delay
+const int WINDOW_SIZE = 3600;   
+const float SAMPLE_RATE = 400000.0; 
 
-int16_t rx_buffers[5][WINDOW_SIZE + 40] = {0}; // Extra padding for shifts
-int16_t tx_buffer[WINDOW_SIZE * 5]; 
+int16_t rx_buffers_0[5][WINDOW_SIZE + 40] = {0};
+int16_t rx_buffers_1[5][WINDOW_SIZE + 40] = {0};
+bool use_buffer_0 = true;
+
+struct RadarScanData {
+    int16_t (*buffers)[WINDOW_SIZE + 40];
+    float scan_angle;
+};
+
+QueueHandle_t dspQueue;
 
 adc_continuous_handle_t adc_handle = NULL;
-uint8_t dma_chunk_buffer[4000] = {0}; // Tiny 4KB streaming buffer instead of 90KB!
+uint8_t dma_chunk_buffer[4000] = {0}; 
 
 void initHardwareDMA() {
     adc_continuous_handle_cfg_t adc_config = { .max_store_buf_size = 30000, .conv_frame_size = 2000 };
@@ -111,7 +117,7 @@ void IRAM_ATTR fireSteeredBeam(float angle_deg) {
     portENABLE_INTERRUPTS();
 }
 
-void recordAcousticEchoes() {
+void recordAcousticEchoes(int16_t (*target_rx_buffers)[WINDOW_SIZE + 40]) {
     ESP_ERROR_CHECK(adc_continuous_start(adc_handle));
 
     int rx_indices[5] = {0, 0, 0, 0, 0};
@@ -133,7 +139,7 @@ void recordAcousticEchoes() {
 
                 if (ch != -1) {
                     if (rx_indices[ch] >= CAPTURE_OFFSET && rx_indices[ch] < CAPTURE_OFFSET + WINDOW_SIZE + 40) {
-                        rx_buffers[ch][rx_indices[ch] - CAPTURE_OFFSET] = val;
+                        target_rx_buffers[ch][rx_indices[ch] - CAPTURE_OFFSET] = val;
                     }
                     rx_indices[ch]++;
                 }
@@ -151,6 +157,211 @@ void recordAcousticEchoes() {
     ESP_ERROR_CHECK(adc_continuous_stop(adc_handle));
 }
 
+void radarEngineTask(void *pvParameters) {
+    float scan_angle = -45.0;
+    float scan_dir = 2.0; // Fast 2-degree step!
+
+    while (1) {
+        fireSteeredBeam(scan_angle);
+
+        int16_t (*active_buffer)[WINDOW_SIZE + 40] = use_buffer_0 ? rx_buffers_0 : rx_buffers_1;
+        recordAcousticEchoes(active_buffer);
+
+        RadarScanData data;
+        data.buffers = active_buffer;
+        data.scan_angle = scan_angle;
+        // Push to DSP queue, don't block if DSP is slow (though it won't be)
+        xQueueSend(dspQueue, &data, (TickType_t)0); 
+
+        use_buffer_0 = !use_buffer_0;
+
+        scan_angle += scan_dir;
+        if (scan_angle >= 45.0) scan_dir = -2.0;
+        if (scan_angle <= -45.0) scan_dir = 2.0;
+        
+        vTaskDelay(pdMS_TO_TICKS(1)); 
+    }
+}
+
+#pragma pack(push, 1)
+struct SerialPacket {
+    uint8_t sync[4];
+    float scan_angle;
+    float target_angle;
+    float distance;
+    float strength;
+};
+#pragma pack(pop)
+
+void dspEngineTask(void *pvParameters) {
+    RadarScanData data;
+    
+    // Tuning parameters
+    float STC_START_GAIN = 1.0;
+    float STC_END_GAIN = 5.0;
+    float STC_POWER = 2.5;
+    const float WAVELENGTH = SPEED_OF_SOUND / 40000.0f;
+    
+    while (1) {
+        if (xQueueReceive(dspQueue, &data, portMAX_DELAY) == pdTRUE) {
+            
+            // 1. Find the Echo Peak (using Center Channel 2)
+            int peak_idx = -1;
+            float max_env = 0;
+            
+            // Remove DC offset for Center Channel
+            long dc_sum = 0;
+            for(int j=0; j<100; j++) dc_sum += data.buffers[2][j+20];
+            float dc_offset = (float)dc_sum / 100.0f;
+
+            for (int j = 0; j < WINDOW_SIZE; j++) {
+                float val = (float)data.buffers[2][j + 20] - dc_offset;
+                float env = abs(val);
+                float t_ratio = (float)j / (float)WINDOW_SIZE;
+                float stc = STC_START_GAIN + (STC_END_GAIN - STC_START_GAIN) * pow(t_ratio, STC_POWER);
+                env *= stc;
+                if (env > max_env) {
+                    max_env = env;
+                    peak_idx = j;
+                }
+            }
+            
+            // If nothing loud enough, ignore
+            if (max_env < 300.0 || peak_idx < 50) {
+                SerialPacket pkt;
+                pkt.sync[0] = 0xAA; pkt.sync[1] = 0xBB; pkt.sync[2] = 0xCC; pkt.sync[3] = 0xDD;
+                pkt.scan_angle = data.scan_angle;
+                pkt.target_angle = 0; pkt.distance = -1.0; pkt.strength = 0;
+                Serial.write((uint8_t*)&pkt, sizeof(SerialPacket));
+                continue;
+            }
+
+            // 2. Extract 100-sample window and IQ Demodulate
+            int start_idx = peak_idx - 30;
+            if(start_idx < 0) start_idx = 0;
+            if(start_idx > WINDOW_SIZE - 100) start_idx = WINDOW_SIZE - 100;
+
+            struct Complex { float r; float i; };
+            Complex X[5][100];
+            
+            for(int ch = 0; ch < 5; ch++) {
+                // Find DC for this channel
+                long sum = 0;
+                for(int j=0; j<100; j++) sum += data.buffers[ch][j+20];
+                float ch_dc = (float)sum / 100.0f;
+
+                for(int k = 0; k < 100; k++) {
+                    int idx = start_idx + k + CALIB_RX_HW_ERROR[ch] + 20;
+                    if(idx < 0) idx = 0;
+                    if(idx >= WINDOW_SIZE + 40) idx = WINDOW_SIZE + 39;
+                    
+                    float val = (float)data.buffers[ch][idx] - ch_dc;
+                    // 40kHz at 400kHz SR = 10 samples per period
+                    float angle = 2.0 * PI * (float)(k % 10) / 10.0;
+                    X[ch][k].r = val * cos(angle);
+                    X[ch][k].i = -val * sin(angle);
+                }
+            }
+
+            // Low-pass filter (Moving Average over 10 samples)
+            Complex X_lpf[5][90];
+            for(int ch = 0; ch < 5; ch++) {
+                for(int k = 0; k < 90; k++) {
+                    float sum_r = 0, sum_i = 0;
+                    for(int m = 0; m < 10; m++) {
+                        sum_r += X[ch][k+m].r;
+                        sum_i += X[ch][k+m].i;
+                    }
+                    X_lpf[ch][k].r = sum_r / 10.0f;
+                    X_lpf[ch][k].i = sum_i / 10.0f;
+                }
+            }
+
+            // 3. Covariance Matrix (5x5)
+            Complex R[5][5];
+            for(int i=0; i<5; i++) {
+                for(int j=0; j<5; j++) {
+                    R[i][j].r = 0; R[i][j].i = 0;
+                    for(int k=0; k<90; k++) {
+                        R[i][j].r += X_lpf[i][k].r * X_lpf[j][k].r + X_lpf[i][k].i * X_lpf[j][k].i;
+                        R[i][j].i += X_lpf[i][k].i * X_lpf[j][k].r - X_lpf[i][k].r * X_lpf[j][k].i;
+                    }
+                }
+            }
+
+            // 4. Power Iteration for Principal Eigenvector
+            Complex v[5] = {{1,0}, {1,0}, {1,0}, {1,0}, {1,0}};
+            for(int iter=0; iter<10; iter++) {
+                Complex v_new[5] = {0};
+                for(int i=0; i<5; i++) {
+                    for(int j=0; j<5; j++) {
+                        v_new[i].r += R[i][j].r * v[j].r - R[i][j].i * v[j].i;
+                        v_new[i].i += R[i][j].r * v[j].i + R[i][j].i * v[j].r;
+                    }
+                }
+                float norm_sq = 0;
+                for(int i=0; i<5; i++) norm_sq += v_new[i].r*v_new[i].r + v_new[i].i*v_new[i].i;
+                float norm = sqrt(norm_sq);
+                for(int i=0; i<5; i++) {
+                    v[i].r = v_new[i].r / norm;
+                    v[i].i = v_new[i].i / norm;
+                }
+            }
+
+            // 5. MUSIC Spectrum Search
+            float best_target_angle = data.scan_angle;
+            float max_music_val = 0;
+
+            for(float theta = data.scan_angle - 15.0f; theta <= data.scan_angle + 15.0f; theta += 1.0f) {
+                float angle_rad = theta * PI / 180.0f;
+                
+                Complex a[5];
+                for(int i=0; i<5; i++) {
+                    float phase = 2.0f * PI * (RX_POSITIONS[i] * sin(angle_rad)) / WAVELENGTH;
+                    a[i].r = cos(phase);
+                    a[i].i = sin(phase);
+                }
+                
+                float proj_r = 0; float proj_i = 0;
+                for(int i=0; i<5; i++) {
+                    proj_r += a[i].r * v[i].r + a[i].i * v[i].i;
+                    proj_i += a[i].r * v[i].i - a[i].i * v[i].r;
+                }
+                
+                float proj_mag_sq = proj_r*proj_r + proj_i*proj_i;
+                float denom = 5.0f - proj_mag_sq;
+                if(denom < 0.0001f) denom = 0.0001f;
+                float music_val = 1.0f / denom;
+                
+                if(music_val > max_music_val) {
+                    max_music_val = music_val;
+                    best_target_angle = theta;
+                }
+            }
+
+            // 6. Calculate Distance and Threshold
+            float time_of_flight = 0.0008 + ((CAPTURE_OFFSET + peak_idx) / SAMPLE_RATE);
+            float distance = (time_of_flight * SPEED_OF_SOUND) / 2.0;
+
+            // MUSIC Peak thresholding (If proj_mag_sq is close to 5, denom is tiny, music_val is HUGE)
+            // music_val > 5.0 means very sharp lock
+            if (max_music_val < 5.0 || distance < 0.65 || distance > 2.0) {
+                distance = -1.0;
+            }
+
+            // 7. Output Packet
+            SerialPacket pkt;
+            pkt.sync[0] = 0xAA; pkt.sync[1] = 0xBB; pkt.sync[2] = 0xCC; pkt.sync[3] = 0xDD;
+            pkt.scan_angle = data.scan_angle;
+            pkt.target_angle = best_target_angle;
+            pkt.distance = distance;
+            pkt.strength = max_music_val;
+
+            Serial.write((uint8_t*)&pkt, sizeof(SerialPacket));
+        }
+    }
+}
+
 void setup() {
     Serial.begin(576000); 
     for(int i = 0; i < 5; i++) {
@@ -158,42 +369,13 @@ void setup() {
         digitalWrite(TX_TRIG[i], LOW); digitalWrite(TX_ECHO[i], LOW);
     }
     initHardwareDMA();
+
+    dspQueue = xQueueCreate(2, sizeof(RadarScanData));
+
+    xTaskCreatePinnedToCore(radarEngineTask, "RadarTask", 8192, NULL, 2, NULL, 1);
+    xTaskCreatePinnedToCore(dspEngineTask, "DSPTask", 32768, NULL, 1, NULL, 0);
 }
 
-float scan_angle = -45.0f;
-float scan_dir = 5.0f;
-
 void loop() {
-    fireSteeredBeam(scan_angle);
-    recordAcousticEchoes();
-    
-    // Hardware RX Error Correction & Matrix Interleaving
-    int idx = 0;
-    for(int j = 0; j < WINDOW_SIZE; j++) {
-        for(int ch = 0; ch < 5; ch++) {
-            int shift = CALIB_RX_HW_ERROR[ch];
-            int read_idx = j + shift + 20; 
-            if(read_idx < 0) read_idx = 0;
-            if(read_idx >= WINDOW_SIZE + 40) read_idx = WINDOW_SIZE + 39;
-            tx_buffer[idx++] = rx_buffers[ch][read_idx];
-        }
-    }
-    
-    // High-Speed Binary Payload
-    uint8_t sync[4] = {0xAA, 0xBB, 0xCC, 0xDD};
-    Serial.write(sync, 4);
-    Serial.write((uint8_t*)&scan_angle, 4);
-    Serial.write((uint8_t*)tx_buffer, WINDOW_SIZE * 5 * 2);
-    
-    // Sweep the Radar
-    scan_angle += scan_dir;
-    if(scan_angle > 45.0f) {
-        scan_angle = 45.0f;
-        scan_dir = -5.0f;
-    } else if (scan_angle < -45.0f) {
-        scan_angle = -45.0f;
-        scan_dir = 5.0f;
-    }
-    
-    delay(5); // Small breather for serial buffer
+    vTaskDelay(pdMS_TO_TICKS(1000));
 }
