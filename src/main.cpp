@@ -4,16 +4,24 @@
 #include "esp_adc/adc_continuous.h"
 #include "hal/adc_types.h"
 #include <math.h>
+#include <Wire.h>
+#include <Adafruit_Sensor.h>
+#include <Adafruit_BME280.h>
+#include <ArduinoEigenDense.h>
+#include <complex>
 
+Adafruit_BME280 bme; 
+bool bme_status = false;
+float current_temp = 30.21;
+float current_hum = 70.84;
 // ==============================================================================
 // I. THE GOLDEN CALIBRATION KEYS (Locked at 2 MHz)
 // ==============================================================================
 const int TX_TRIG[5] = {4, 14, 17, 19, 25};
 const int TX_ECHO[5] = {13, 16, 18, 23, 26};
 
-const int CALIB_TX_HW_TICKS[5] = {600, 1680, 1320, 2040, 0};
-// We pre-rounded these so the CPU doesn't have to do it 90,000 times a second!
-const int CALIB_RX_HW_SHIFT[5] = {-8, 8, 0, -8, 8};
+const int CALIB_TX_HW_TICKS[5] = {120, 1680, 1200, 2280, 0};
+const int CALIB_RX_HW_SHIFT[5] = {-16, 16, 0, -16, 8};
 
 const int CAPTURE_OFFSET = 800;  
 const int WINDOW_SIZE = 3600; // Wide enough for a >2.0m Return Range
@@ -22,12 +30,21 @@ const int WINDOW_SIZE = 3600; // Wide enough for a >2.0m Return Range
 // Max ADC is 4095. 3 shots max out at 12285. 
 // This easily fits inside a 16-bit integer (max 32767).
 int16_t accumulation_buffers[5][WINDOW_SIZE] = {0}; 
+int16_t (*processing_buffers)[WINDOW_SIZE] = nullptr;
+
+float processing_angle = 0;
+float processing_temp = 30.21;
+float processing_hum = 70.84;
+
+SemaphoreHandle_t dsp_ready_sem;
+SemaphoreHandle_t dsp_done_sem;
+TaskHandle_t dspTaskHandle;
 
 adc_continuous_handle_t adc_handle = NULL;
 const uint32_t DMA_FLAT_BUFFER_SIZE = 48000; 
 uint8_t dma_flat_buffer[DMA_FLAT_BUFFER_SIZE] = {0};
 
-const adc_channel_t RX_CHANNELS[5] = {ADC_CHANNEL_4, ADC_CHANNEL_5, ADC_CHANNEL_7, ADC_CHANNEL_0, ADC_CHANNEL_3};
+const adc_channel_t RX_CHANNELS[5] = {ADC_CHANNEL_5, ADC_CHANNEL_4, ADC_CHANNEL_7, ADC_CHANNEL_3, ADC_CHANNEL_0};
 
 // ==============================================================================
 // II. HIGH-RESOLUTION DMA CORE (2 MHz)
@@ -151,8 +168,11 @@ void fireBeamAndAverage(int num_shots, float target_angle) {
     for(int shot = 0; shot < num_shots; shot++) {
         fireSteeredBeam(target_angle); 
         recordAcousticEchoes();
-        // SPEED HACK: Dropped from 40ms to 15ms based on 2.0m Speed of Sound math
-        delay(40); 
+        // Jitter the Pulse Repetition Interval (PRI) to randomize the time-of-flight of multi-path
+        // echoes. This causes ghost reflections to jump wildly in distance, allowing the UI's
+        // tracking filter to easily reject them as noise.
+        int jitter = 15 + (rand() % 15); // Random delay between 15ms and 30ms
+        delay(jitter); 
     }
     
     for(int i = 0; i < 5; i++) {
@@ -163,47 +183,271 @@ void fireBeamAndAverage(int num_shots, float target_angle) {
 }
 
 // ==============================================================================
-// IV. TRACK-WHILE-SCAN (TWS) LIVE LOOP
+// IV. CORE 0: DSP MATH & COMMUNICATION TASK
+// ==============================================================================
+#pragma pack(push, 1)
+struct TargetDataPayload {
+    uint8_t sync[4];       
+    float scan_angle;      
+    float temp;
+    float hum;
+    float target_range;
+    float target_x;
+    float target_y;
+    float confidence;
+    float pad;             
+};
+#pragma pack(pop)
+
+void dspTask(void *pvParameters) {
+    while(1) {
+        // Wait until Core 1 gives us new data
+        xSemaphoreTake(dsp_ready_sem, portMAX_DELAY);
+        
+        TargetDataPayload payload;
+        payload.sync[0] = 0xAA; payload.sync[1] = 0xBB; payload.sync[2] = 0xCC; payload.sync[3] = 0xDD;
+        payload.scan_angle = processing_angle;
+        payload.temp = processing_temp;
+        payload.hum = processing_hum;
+        payload.target_range = 0;
+        payload.target_x = 0;
+        payload.target_y = 0;
+        payload.confidence = 0;
+        payload.pad = 0;
+
+        float speed_of_sound = 331.3f + (0.606f * processing_temp) + (0.0124f * processing_hum);
+        const int start_idx = 50;
+        const int end_idx = WINDOW_SIZE - 50;
+        const int num_samples = end_idx - start_idx;
+        
+        float channel_bias[5] = {0};
+        float var_sum = 0;
+        for (int ch = 0; ch < 5; ch++) {
+            float sum = 0;
+            int count = 0;
+            for (int j = start_idx; j < end_idx; j++) {
+                int original_idx = j + CALIB_RX_HW_SHIFT[ch];
+                if (original_idx >= 0 && original_idx < WINDOW_SIZE) {
+                    sum += (float)processing_buffers[ch][original_idx] / 4095.0f;
+                    count++;
+                }
+            }
+            channel_bias[ch] = (count > 0) ? (sum / count) : 0.0f;
+            
+            float var = 0;
+            for (int j = start_idx; j < end_idx; j++) {
+                int original_idx = j + CALIB_RX_HW_SHIFT[ch];
+                if (original_idx >= 0 && original_idx < WINDOW_SIZE) {
+                    float val = ((float)processing_buffers[ch][original_idx] / 4095.0f) - channel_bias[ch];
+                    var += val * val;
+                }
+            }
+            var_sum += var / num_samples;
+        }
+        float signal_energy = var_sum / 5.0f;
+        float noise_floor_threshold = 0.00004f;
+        
+        typedef Eigen::Matrix<std::complex<float>, 5, 5> Matrix5cf;
+        typedef Eigen::Matrix<std::complex<float>, 5, 1> Vector5cf;
+        
+        if (signal_energy > noise_floor_threshold) {
+            Matrix5cf Rxx = Matrix5cf::Zero();
+            
+            float stc_start = 1.0f;
+            float stc_end = 5.0f; 
+            int delay_idx = 2;
+            
+            float max_env_sq = 0;
+            int peak_time_idx = 0;
+
+            // --- PASS 1: Find the Peak (Time of Flight) ---
+            for (int j = start_idx + delay_idx + 1; j < end_idx; j += 4) {
+                float inst_env_sq = 0;
+                for (int ch = 0; ch < 5; ch++) {
+                    int orig_j = j + CALIB_RX_HW_SHIFT[ch];
+                    float real_part = 0, imag_part = 0;
+                    if(orig_j >= 0 && orig_j < WINDOW_SIZE) {
+                        real_part = ((float)processing_buffers[ch][orig_j] / 4095.0f) - channel_bias[ch];
+                    }
+                    int orig_delay1 = (j - 2) + CALIB_RX_HW_SHIFT[ch];
+                    int orig_delay2 = (j - 3) + CALIB_RX_HW_SHIFT[ch];
+                    float v1 = 0, v2 = 0;
+                    if(orig_delay1 >= 0 && orig_delay1 < WINDOW_SIZE) v1 = ((float)processing_buffers[ch][orig_delay1] / 4095.0f) - channel_bias[ch];
+                    if(orig_delay2 >= 0 && orig_delay2 < WINDOW_SIZE) v2 = ((float)processing_buffers[ch][orig_delay2] / 4095.0f) - channel_bias[ch];
+                    
+                    imag_part = (v1 + v2) / 2.0f;
+                    inst_env_sq += (real_part*real_part + imag_part*imag_part);
+                }
+                
+                float min_time = (0.15f * 2.0f) / speed_of_sound;
+                int min_idx = (int)((min_time - 0.0008f) * 400000.0f - CAPTURE_OFFSET);
+                if (j > min_idx) {
+                    if (inst_env_sq > max_env_sq) {
+                        max_env_sq = inst_env_sq;
+                        peak_time_idx = j;
+                    }
+                }
+            }
+
+            // --- PASS 2: Calculate Spatial Covariance (Rxx) ONLY around the peak ---
+            // This prevents multipath ghosts at different distances from corrupting the MUSIC matrix!
+            int rxx_count = 0;
+            int window_half_width = 15; // Only look at ~75us around the peak
+            int rxx_start = max((int)(start_idx + delay_idx + 1), peak_time_idx - window_half_width);
+            int rxx_end = min((int)end_idx, peak_time_idx + window_half_width);
+            
+            for (int j = rxx_start; j < rxx_end; j++) {
+                float normalized_time = (float)(j) / (float)WINDOW_SIZE;
+                float stc = stc_start + (stc_end - stc_start) * (normalized_time * normalized_time);
+                
+                Vector5cf X;
+                for (int ch = 0; ch < 5; ch++) {
+                    int orig_j = j + CALIB_RX_HW_SHIFT[ch];
+                    float real_part = 0, imag_part = 0;
+                    if(orig_j >= 0 && orig_j < WINDOW_SIZE) {
+                        real_part = ((float)processing_buffers[ch][orig_j] / 4095.0f) - channel_bias[ch];
+                    }
+                    int orig_delay1 = (j - 2) + CALIB_RX_HW_SHIFT[ch];
+                    int orig_delay2 = (j - 3) + CALIB_RX_HW_SHIFT[ch];
+                    float v1 = 0, v2 = 0;
+                    if(orig_delay1 >= 0 && orig_delay1 < WINDOW_SIZE) v1 = ((float)processing_buffers[ch][orig_delay1] / 4095.0f) - channel_bias[ch];
+                    if(orig_delay2 >= 0 && orig_delay2 < WINDOW_SIZE) v2 = ((float)processing_buffers[ch][orig_delay2] / 4095.0f) - channel_bias[ch];
+                    
+                    imag_part = (v1 + v2) / 2.0f;
+                    
+                    real_part *= stc;
+                    imag_part *= stc;
+                    X(ch) = std::complex<float>(real_part, imag_part);
+                }
+                Rxx += (X * X.adjoint());
+                rxx_count++;
+            }
+            if (rxx_count > 0) {
+                Rxx /= (float)(rxx_count);
+            }
+            
+            Eigen::SelfAdjointEigenSolver<Matrix5cf> eigensolver(Rxx);
+            Matrix5cf eigenvectors = eigensolver.eigenvectors(); 
+            Eigen::Matrix<std::complex<float>, 5, 4> noise_subspace = eigenvectors.leftCols<4>();
+            Matrix5cf P_noise = noise_subspace * noise_subspace.adjoint();
+            
+            int cone_min = (int)processing_angle - 10;
+            int cone_max = (int)processing_angle + 10;
+            float max_spectrum = -1.0f;
+            int best_angle = 0;
+            
+            float mic_positions[5] = {-0.025f, -0.013f, -0.002f, 0.009f, 0.025f};
+            float wavelength = speed_of_sound / 40000.0f;
+            
+            float global_max = 0;
+            // Only search within the +/- 10 degree effective beamwidth cone
+            for (int theta = cone_min; theta <= cone_max; theta++) {
+                float theta_rad = theta * (M_PI / 180.0f);
+                Vector5cf a;
+                for (int ch = 0; ch < 5; ch++) {
+                    float phase = (2.0f * M_PI / wavelength) * mic_positions[ch] * sinf(theta_rad);
+                    a(ch) = std::complex<float>(cosf(phase), -sinf(phase));
+                }
+                std::complex<float> denom = a.adjoint() * P_noise * a;
+                float p = 1.0f / abs(denom);
+                
+                if (p > global_max) global_max = p;
+                
+                if (p > max_spectrum) {
+                    max_spectrum = p;
+                    best_angle = theta;
+                }
+            }
+            
+            // max_spectrum and global_max are now within the cone. 
+            // Normalized peak is essentially 1.0, relying on Gaussian weight.
+            float normalized_peak = (global_max > 0) ? (max_spectrum / global_max) : 0;
+            payload.confidence = normalized_peak;
+            
+            // Gaussian angle-dependent threshold: 0.85 at 0°, 0.55 at ±10°, 0.50 at ±15°+
+            float angle_boost = 0.35f * expf(-(float)(best_angle * best_angle) / 50.0f);
+            float visual_threshold = 0.50f + angle_boost;
+            if (normalized_peak > visual_threshold) {
+                float lock_angle_rad = best_angle * (M_PI / 180.0f);
+                float time_of_flight = 0.0008f + ((CAPTURE_OFFSET + peak_time_idx) / 400000.0f);
+                payload.target_range = (time_of_flight * speed_of_sound) / 2.0f;
+                payload.target_x = payload.target_range * sinf(lock_angle_rad);
+                payload.target_y = payload.target_range * cosf(lock_angle_rad);
+                payload.pad = max_env_sq;
+            }
+        }
+        
+        Serial.write((uint8_t*)&payload, sizeof(TargetDataPayload));
+        
+        // Tell Core 1 we are done
+        xSemaphoreGive(dsp_done_sem);
+    }
+}
+
+// ==============================================================================
+// V. CORE 1: TRACK-WHILE-SCAN (TWS) ACQUISITION LOOP
 // ==============================================================================
 void setup() {
     Serial.begin(576000); 
+    
+    Wire.begin();
+    bme_status = bme.begin(0x76);
+    if (!bme_status) {
+        bme_status = bme.begin(0x77);
+    }
+    
     for(int i = 0; i < 5; i++) {
         pinMode(TX_TRIG[i], OUTPUT); pinMode(TX_ECHO[i], OUTPUT);
         digitalWrite(TX_TRIG[i], LOW); digitalWrite(TX_ECHO[i], LOW);
     }
     initHardwareDMA();
     
-    Serial.println("System Boot. Stable Long-Range Array Online.");
+    // Dynamically allocate to avoid .bss overflow
+    processing_buffers = (int16_t (*)[WINDOW_SIZE]) malloc(5 * WINDOW_SIZE * sizeof(int16_t));
+    
+    dsp_ready_sem = xSemaphoreCreateBinary();
+    dsp_done_sem = xSemaphoreCreateBinary();
+    xSemaphoreGive(dsp_done_sem); // Start free
+    
+    // Launch DSP task on Core 0
+    xTaskCreatePinnedToCore(dspTask, "DSPTask", 16384, NULL, 1, &dspTaskHandle, 0);
+    
+    Serial.println("System Boot. Dual-Core Radar Engine Online.");
     delay(1000); 
 }
 
 void loop() {
-    static const float scan_angles[5] = {-40.0, -20.0, 0.0, 20.0, 40.0};
+    static unsigned long last_bme_read = 0;
+    if (bme_status && (millis() - last_bme_read > 2000)) {
+        current_temp = bme.readTemperature();
+        current_hum = bme.readHumidity();
+        last_bme_read = millis();
+    }
+
+    // Interleaved sweep pattern to maximize spatial distance between consecutive pings.
+    // This forces echoes from the previous sweep to arrive at an off-axis angle in the current sweep,
+    // where they are heavily suppressed by the MUSIC algorithm's spatial cone and Gaussian weighting,
+    // effectively eliminating "ghosts" without slowing down the radar.
+    static const float scan_angles[5] = {-40.0, 20.0, -20.0, 40.0, 0.0};
     static int angle_index = 0;
     
     float current_angle = scan_angles[angle_index];
-    fireBeamAndAverage(3, current_angle); 
     
-    const uint8_t sync_word[4] = {0xAA, 0xBB, 0xCC, 0xDD};
-    Serial.write(sync_word, 4);
-    Serial.write((uint8_t*)&current_angle, sizeof(float));
+    // 1. Acquire Data (Takes ~30ms total)
+    fireBeamAndAverage(1, current_angle); 
     
-    int16_t* payload = (int16_t*)dma_flat_buffer;
-    int idx = 0;
+    // 2. Wait for Core 0 to finish processing the previous angle's data
+    xSemaphoreTake(dsp_done_sem, portMAX_DELAY);
     
-    for(int j = 0; j < WINDOW_SIZE; j++) { 
-        for(int ch = 0; ch < 5; ch++) {
-            // SPEED HACK: Use the pre-calculated integer, zero float math!
-            int original_idx = j + CALIB_RX_HW_SHIFT[ch]; 
-            int16_t val = 0; 
-            
-            if(original_idx >= 0 && original_idx < WINDOW_SIZE) {
-                val = accumulation_buffers[ch][original_idx];
-            }
-            payload[idx++] = val;
-        }
-    }
+    // 3. Copy new data to processing buffer for Core 0
+    memcpy(processing_buffers, accumulation_buffers, sizeof(accumulation_buffers));
+    processing_angle = current_angle;
+    processing_temp = current_temp;
+    processing_hum = current_hum;
     
-    Serial.write((uint8_t*)payload, 36000);
+    // 4. Trigger Core 0 to start processing the new data
+    xSemaphoreGive(dsp_ready_sem);
+    
+    // 5. Advance angle for the next acquisition loop
     angle_index = (angle_index + 1) % 5;
 }

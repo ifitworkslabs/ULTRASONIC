@@ -5,7 +5,7 @@ import struct
 import multiprocessing
 import queue
 import pyqtgraph as pg
-from pyqtgraph.Qt import QtCore
+from pyqtgraph.Qt import QtCore, QtWidgets
 
 # ==========================================
 # I. RADAR PHYSICS & RANGE CALIBRATION
@@ -78,7 +78,7 @@ def serial_worker(port, baud, data_queue):
             if len(payload_bytes) < 32: continue
             scan_angle, temp, hum, target_range, target_x, target_y, confidence, pad = struct.unpack('<ffffffff', payload_bytes)
             
-            data_queue.put((scan_angle, temp, hum, target_range, target_x, target_y, confidence))
+            data_queue.put((scan_angle, temp, hum, target_range, target_x, target_y, confidence, pad))
             
         except Exception as e:
             print(f"Serial Worker Exception: {e}")
@@ -161,14 +161,40 @@ if __name__ == '__main__':
     target_pin = p_radar.plot(pen=pg.mkPen('r', width=3))
     pin_size = 0.15
     
+    # 3. COVERAGE TRACE (Breadcrumbs)
+    scatter_trace = pg.ScatterPlotItem(size=6, pen=pg.mkPen(None), brush=pg.mkBrush(255, 255, 0, 100))
+    p_radar.addItem(scatter_trace)
+    trace_memory = []
+    
+    # 4. PAUSE BUTTON
+    trace_active = True
+    pause_btn = QtWidgets.QPushButton("PAUSE / RESUME TRACE")
+    pause_btn.setStyleSheet("font-size: 14px; font-weight: bold; background-color: #333; color: yellow; padding: 8px;")
+    
+    def toggle_trace():
+        global trace_active
+        trace_active = not trace_active
+        if trace_active:
+            pause_btn.setStyleSheet("font-size: 14px; font-weight: bold; background-color: #333; color: yellow; padding: 8px;")
+        else:
+            pause_btn.setStyleSheet("font-size: 14px; font-weight: bold; background-color: #500; color: red; padding: 8px;")
+            
+    pause_btn.clicked.connect(toggle_trace)
+    proxy = QtWidgets.QGraphicsProxyWidget()
+    proxy.setWidget(pause_btn)
+    
+    # Add to a new row at the bottom of the right column
+    btn_layout = win.addLayout(row=3, col=1)
+    btn_layout.addItem(proxy)
+    
     active_targets = []
     target_text_items = []
 
     def update():
-        global SPEED_OF_SOUND, active_targets
+        global SPEED_OF_SOUND, active_targets, trace_memory, trace_active
         while not data_queue.empty():
             try:
-                current_scan_angle, temp, hum, target_range, target_x, target_y, confidence = data_queue.get_nowait()
+                current_scan_angle, temp, hum, target_range, target_x, target_y, confidence, raw_energy = data_queue.get_nowait()
             except queue.Empty:
                 break
                 
@@ -193,19 +219,28 @@ if __name__ == '__main__':
             if confidence > VISUAL_THRESHOLD and target_range > 0:
                 lock_angle_deg = np.degrees(np.arctan2(target_x, target_y))
                 
-                # Check if this detection belongs to an existing target (within 0.3m)
+                # Check if this detection belongs to an existing target (Dynamic radius based on range)
+                # At 2 meters, angular error of 10 degrees is ~0.35m physically. 
+                dynamic_merge_radius = 0.2 + (0.2 * target_range)
+                
                 merged = False
                 for t in active_targets:
                     dist = np.hypot(t['tx'] - target_x, t['ty'] - target_y)
-                    if dist < 0.3:
-                        # Smooth the position and reset TTL
-                        alpha = 0.3
+                    if dist < dynamic_merge_radius:
+                        # Confidence-weighted tracking: strong peaks pull the track normally, 
+                        # weak ghosts have almost zero effect, completely eliminating drift!
+                        weight_ratio = (confidence / max(t['peak'], 0.1)) ** 2
+                        alpha = 0.3 * min(weight_ratio, 1.0)
+                        
                         t['tx'] = (1.0 - alpha) * t['tx'] + alpha * target_x
                         t['ty'] = (1.0 - alpha) * t['ty'] + alpha * target_y
                         t['range'] = (1.0 - alpha) * t['range'] + alpha * target_range
                         t['deg'] = (1.0 - alpha) * t['deg'] + alpha * lock_angle_deg
-                        t['peak'] = max(t['peak'], confidence)
+                        # EMA the peak confidence so it can slowly adapt down
+                        t['peak'] = (0.9 * t['peak']) + (0.1 * confidence)
+                        t['raw'] = (0.9 * t.get('raw', 0)) + (0.1 * raw_energy)
                         t['ttl'] = 15 # stay alive for 3 full 5-angle sweeps
+                        t['hits'] += 1
                         merged = True
                         break
                 
@@ -214,8 +249,13 @@ if __name__ == '__main__':
                         'deg': lock_angle_deg,
                         'peak': confidence, 'range': target_range,
                         'tx': target_x, 'ty': target_y,
-                        'ttl': 15
+                        'ttl': 15,
+                        'hits': 1,
+                        'raw': raw_energy
                     })
+
+                pass
+
             # =======================================================
 
             # --- RENDER GRAPHICS ---
@@ -259,11 +299,27 @@ if __name__ == '__main__':
                 t.setText("")
             
             for i, data in enumerate(active_targets):
+                if data['hits'] < 3:
+                    continue
+                    
                 music_pts.append({'pos': (data['deg'], data['peak'])})
                 tx, ty = data['tx'], data['ty']
                 radar_pts.append({'pos': (tx, ty)})
                 
-                target_text_items[i].setText(f"{data['range']:.2f}m")
+                # --- Trace Breadcrumbs (Paint the Oval) ---
+                if trace_active:
+                    add_trace = True
+                    if len(trace_memory) > 0:
+                        last_tx, last_ty = trace_memory[-1]['pos']
+                        if np.hypot(last_tx - tx, last_ty - ty) < 0.05:
+                            add_trace = False # Only drop a crumb if moved 5cm
+                    
+                    if add_trace:
+                        trace_memory.append({'pos': (tx, ty)})
+                        if len(trace_memory) > 1000: # Cap at 1000 dots
+                            trace_memory.pop(0)
+                
+                target_text_items[i].setText(f"{data['range']:.2f}m\nPeak: {data['peak']:.2f}\nRaw: {data.get('raw', 0):.2f}")
                 target_text_items[i].setPos(tx, ty)
                 
                 # BUILD THE TACTICAL PIN CROSSHAIR
@@ -280,6 +336,7 @@ if __name__ == '__main__':
 
             scatter_music.setData(music_pts)
             scatter_radar.setData(radar_pts)
+            scatter_trace.setData(trace_memory)
             
             # DRAW THE PIN ON THE MAP
             target_pin.setData(pin_x, pin_y)
