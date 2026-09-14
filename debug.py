@@ -92,8 +92,7 @@ if __name__ == '__main__':
     print("Professor's Target Tracking Engine Online (2 MHz).")
     print(">>> INSTANT VISUAL THRESHOLD PIN-LOCK ACTIVE <<<")
     print("==================================================\n")
-
-    data_queue = multiprocessing.Queue(maxsize=0) 
+    data_queue = multiprocessing.Queue(maxsize=100) 
     
     worker_process = multiprocessing.Process(
         target=serial_worker, 
@@ -126,7 +125,7 @@ if __name__ == '__main__':
     p_music.addItem(beam_indicator_music)
     
     # 1. THE VISUAL THRESHOLD LINE
-    VISUAL_THRESHOLD = 0.65
+    VISUAL_THRESHOLD = 0.6
     thresh_line = pg.InfiniteLine(angle=0, pos=VISUAL_THRESHOLD, pen=pg.mkPen('y', width=2, style=QtCore.Qt.DashLine))
     p_music.addItem(thresh_line)
 
@@ -267,13 +266,11 @@ if __name__ == '__main__':
 
             # We can't plot the full spectrum anymore, just show a peak in the cone
             spectrum = np.ones(len(THETA_RADIANS)) * 0.0001
-            if confidence > 0:
-                # Approximate a peak
-                peak_idx = np.argmin(np.abs(THETA_DEGREES - current_scan_angle))
+            if confidence > VISUAL_THRESHOLD:
                 if target_range > 0:
                     lock_angle = np.degrees(np.arctan2(target_x, target_y))
                     peak_idx = np.argmin(np.abs(THETA_DEGREES - lock_angle))
-                spectrum[peak_idx] = confidence
+                    spectrum[peak_idx] = confidence
                 
             curve_music.setData(THETA_DEGREES, spectrum)
 
@@ -299,7 +296,7 @@ if __name__ == '__main__':
                 t.setText("")
             
             for i, data in enumerate(active_targets):
-                if data['hits'] < 3:
+                if data['hits'] < 1: # Draw it immediately! The ESP32 already verified it.
                     continue
                     
                 music_pts.append({'pos': (data['deg'], data['peak'])})

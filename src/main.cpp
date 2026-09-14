@@ -29,8 +29,9 @@ const int WINDOW_SIZE = 3600; // Wide enough for a >2.0m Return Range
 // THE MEMORY DIET (UPDATED): 
 // Max ADC is 4095. 3 shots max out at 12285. 
 // This easily fits inside a 16-bit integer (max 32767).
-int16_t accumulation_buffers[5][WINDOW_SIZE] = {0}; 
-int16_t (*processing_buffers)[WINDOW_SIZE] = nullptr;
+// Safe up to 15 shots before integer overflow (Max 65,535)
+uint16_t accumulation_buffers[5][WINDOW_SIZE] = {0}; 
+uint16_t (*processing_buffers)[WINDOW_SIZE] = nullptr;
 
 float processing_angle = 0;
 float processing_temp = 30.21;
@@ -215,7 +216,7 @@ void dspTask(void *pvParameters) {
         payload.confidence = 0;
         payload.pad = 0;
 
-        float speed_of_sound = 331.3f + (0.606f * processing_temp) + (0.0124f * processing_hum);
+        float speed_of_sound = 331.4f + (0.606f * processing_temp) + (0.0124f * processing_hum);
         const int start_idx = 50;
         const int end_idx = WINDOW_SIZE - 50;
         const int num_samples = end_idx - start_idx;
@@ -245,7 +246,7 @@ void dspTask(void *pvParameters) {
             var_sum += var / num_samples;
         }
         float signal_energy = var_sum / 5.0f;
-        float noise_floor_threshold = 0.00004f;
+        float noise_floor_threshold = 0.00002f; // Reject absolute silence
         
         typedef Eigen::Matrix<std::complex<float>, 5, 5> Matrix5cf;
         typedef Eigen::Matrix<std::complex<float>, 5, 1> Vector5cf;
@@ -269,13 +270,16 @@ void dspTask(void *pvParameters) {
                     if(orig_j >= 0 && orig_j < WINDOW_SIZE) {
                         real_part = ((float)processing_buffers[ch][orig_j] / 4095.0f) - channel_bias[ch];
                     }
-                    int orig_delay1 = (j - 2) + CALIB_RX_HW_SHIFT[ch];
-                    int orig_delay2 = (j - 3) + CALIB_RX_HW_SHIFT[ch];
-                    float v1 = 0, v2 = 0;
-                    if(orig_delay1 >= 0 && orig_delay1 < WINDOW_SIZE) v1 = ((float)processing_buffers[ch][orig_delay1] / 4095.0f) - channel_bias[ch];
-                    if(orig_delay2 >= 0 && orig_delay2 < WINDOW_SIZE) v2 = ((float)processing_buffers[ch][orig_delay2] / 4095.0f) - channel_bias[ch];
-                    
-                    imag_part = (v1 + v2) / 2.0f;
+                    // EXACT 2.5 SAMPLE INTERPOLATION FOR 90-DEGREE I/Q SHIFT AT 400kHz
+                    int d2 = (j - 2) + CALIB_RX_HW_SHIFT[ch];
+                    int d3 = (j - 3) + CALIB_RX_HW_SHIFT[ch];
+                    if (d2 >= 0 && d2 < WINDOW_SIZE && d3 >= 0 && d3 < WINDOW_SIZE) {
+                        float v2 = ((float)processing_buffers[ch][d2] / 4095.0f) - channel_bias[ch];
+                        float v3 = ((float)processing_buffers[ch][d3] / 4095.0f) - channel_bias[ch];
+                        imag_part = (v2 + v3) / 2.0f; 
+                    } else {
+                        imag_part = 0.0f;
+                    }
                     inst_env_sq += (real_part*real_part + imag_part*imag_part);
                 }
                 
@@ -292,7 +296,7 @@ void dspTask(void *pvParameters) {
             // --- PASS 2: Calculate Spatial Covariance (Rxx) ONLY around the peak ---
             // This prevents multipath ghosts at different distances from corrupting the MUSIC matrix!
             int rxx_count = 0;
-            int window_half_width = 15; // Only look at ~75us around the peak
+            int window_half_width = 75; // Cover 3 full wave cycles to stabilize the matrix
             int rxx_start = max((int)(start_idx + delay_idx + 1), peak_time_idx - window_half_width);
             int rxx_end = min((int)end_idx, peak_time_idx + window_half_width);
             
@@ -307,13 +311,16 @@ void dspTask(void *pvParameters) {
                     if(orig_j >= 0 && orig_j < WINDOW_SIZE) {
                         real_part = ((float)processing_buffers[ch][orig_j] / 4095.0f) - channel_bias[ch];
                     }
-                    int orig_delay1 = (j - 2) + CALIB_RX_HW_SHIFT[ch];
-                    int orig_delay2 = (j - 3) + CALIB_RX_HW_SHIFT[ch];
-                    float v1 = 0, v2 = 0;
-                    if(orig_delay1 >= 0 && orig_delay1 < WINDOW_SIZE) v1 = ((float)processing_buffers[ch][orig_delay1] / 4095.0f) - channel_bias[ch];
-                    if(orig_delay2 >= 0 && orig_delay2 < WINDOW_SIZE) v2 = ((float)processing_buffers[ch][orig_delay2] / 4095.0f) - channel_bias[ch];
-                    
-                    imag_part = (v1 + v2) / 2.0f;
+                    // EXACT 2.5 SAMPLE INTERPOLATION FOR 90-DEGREE I/Q SHIFT AT 400kHz
+                    int d2 = (j - 2) + CALIB_RX_HW_SHIFT[ch];
+                    int d3 = (j - 3) + CALIB_RX_HW_SHIFT[ch];
+                    if (d2 >= 0 && d2 < WINDOW_SIZE && d3 >= 0 && d3 < WINDOW_SIZE) {
+                        float v2 = ((float)processing_buffers[ch][d2] / 4095.0f) - channel_bias[ch];
+                        float v3 = ((float)processing_buffers[ch][d3] / 4095.0f) - channel_bias[ch];
+                        imag_part = (v2 + v3) / 2.0f; 
+                    } else {
+                        imag_part = 0.0f;
+                    }
                     
                     real_part *= stc;
                     imag_part *= stc;
@@ -326,22 +333,28 @@ void dspTask(void *pvParameters) {
                 Rxx /= (float)(rxx_count);
             }
             
+            // Diagonal Loading: inject artificial noise to prevent matrix singularity
+            for (int i = 0; i < 5; i++) {
+                Rxx(i, i) += std::complex<float>(0.00005f, 0.0f);
+            }
+            
             Eigen::SelfAdjointEigenSolver<Matrix5cf> eigensolver(Rxx);
             Matrix5cf eigenvectors = eigensolver.eigenvectors(); 
             Eigen::Matrix<std::complex<float>, 5, 4> noise_subspace = eigenvectors.leftCols<4>();
             Matrix5cf P_noise = noise_subspace * noise_subspace.adjoint();
             
-            int cone_min = (int)processing_angle - 10;
-            int cone_max = (int)processing_angle + 10;
-            float max_spectrum = -1.0f;
-            int best_angle = 0;
-            
             float mic_positions[5] = {-0.025f, -0.013f, -0.002f, 0.009f, 0.025f};
             float wavelength = speed_of_sound / 40000.0f;
+
+            float global_music_max = 0.0f;
+            float best_two_way_peak = 0.0f;
+            int best_angle = 0;
             
-            float global_max = 0;
-            // Only search within the +/- 10 degree effective beamwidth cone
-            for (int theta = cone_min; theta <= cone_max; theta++) {
+            // Standard deviation of 12.0 creates a much wider, forgiving beam
+            const float TX_SIGMA = 12.0f; 
+            
+            // 1. Search the ENTIRE room
+            for (int theta = -90; theta <= 90; theta++) {
                 float theta_rad = theta * (M_PI / 180.0f);
                 Vector5cf a;
                 for (int ch = 0; ch < 5; ch++) {
@@ -349,32 +362,45 @@ void dspTask(void *pvParameters) {
                     a(ch) = std::complex<float>(cosf(phase), -sinf(phase));
                 }
                 std::complex<float> denom = a.adjoint() * P_noise * a;
-                float p = 1.0f / abs(denom);
                 
-                if (p > global_max) global_max = p;
+                // --- RX GAIN (The raw MUSIC spatial spectrum) ---
+                float p_music = 1.0f / abs(denom); 
                 
-                if (p > max_spectrum) {
-                    max_spectrum = p;
+                // Track the absolute loudest echo in the room (used for the final Python score)
+                if (p_music > global_music_max) {
+                    global_music_max = p_music; 
+                }
+                
+                // --- TX GAIN (The mathematical representation of your firing cone) ---
+                float angle_diff = (float)theta - processing_angle;
+                // Gaussian formula: Drops off rapidly outside the +-10 degree threshold
+                float tx_gain = expf(-(angle_diff * angle_diff) / (2.0f * TX_SIGMA * TX_SIGMA)); 
+                
+                // --- THE TWO-WAY FILTER (RX * TX) ---
+                float p_two_way = p_music * tx_gain;
+                
+                // Find the best target after the Two-Way multiplication
+                if (p_two_way > best_two_way_peak) {
+                    best_two_way_peak = p_two_way;
                     best_angle = theta;
                 }
             }
             
-            // max_spectrum and global_max are now within the cone. 
-            // Normalized peak is essentially 1.0, relying on Gaussian weight.
-            float normalized_peak = (global_max > 0) ? (max_spectrum / global_max) : 0;
-            payload.confidence = normalized_peak;
+            // 2. THE ULTIMATE CONFIDENCE SCORE
+            // We divide our best Two-Way target by the absolute loudest raw echo in the room.
+            payload.confidence = (global_music_max > 0) ? (best_two_way_peak / global_music_max) : 0.0f;
             
-            // Gaussian angle-dependent threshold: 0.85 at 0°, 0.55 at ±10°, 0.50 at ±15°+
-            float angle_boost = 0.35f * expf(-(float)(best_angle * best_angle) / 50.0f);
-            float visual_threshold = 0.50f + angle_boost;
-            if (normalized_peak > visual_threshold) {
-                float lock_angle_rad = best_angle * (M_PI / 180.0f);
-                float time_of_flight = 0.0008f + ((CAPTURE_OFFSET + peak_time_idx) / 400000.0f);
-                payload.target_range = (time_of_flight * speed_of_sound) / 2.0f;
-                payload.target_x = payload.target_range * sinf(lock_angle_rad);
-                payload.target_y = payload.target_range * cosf(lock_angle_rad);
-                payload.pad = max_env_sq;
-            }
+            // 3. ALWAYS calculate and send the physical coordinates
+            float lock_angle_rad = best_angle * (M_PI / 180.0f);
+            float time_of_flight = 0.0008f + ((CAPTURE_OFFSET + peak_time_idx) / 400000.0f);
+            payload.target_range = (time_of_flight * speed_of_sound) / 2.0f;
+            payload.target_x = payload.target_range * sinf(lock_angle_rad);
+            payload.target_y = payload.target_range * cosf(lock_angle_rad);
+            payload.pad = max_env_sq;
+        } else {
+            // If it's pure silence, output zero confidence!
+            payload.confidence = 0.0f;
+            payload.target_range = 0.0f;
         }
         
         Serial.write((uint8_t*)&payload, sizeof(TargetDataPayload));
@@ -403,7 +429,13 @@ void setup() {
     initHardwareDMA();
     
     // Dynamically allocate to avoid .bss overflow
-    processing_buffers = (int16_t (*)[WINDOW_SIZE]) malloc(5 * WINDOW_SIZE * sizeof(int16_t));
+    processing_buffers = (uint16_t (*)[WINDOW_SIZE]) malloc(5 * WINDOW_SIZE * sizeof(uint16_t));
+    if (processing_buffers == NULL) {
+        Serial.println("FATAL: Failed to allocate processing_buffers");
+        while (1) {
+            delay(100);
+        }
+    }
     
     dsp_ready_sem = xSemaphoreCreateBinary();
     dsp_done_sem = xSemaphoreCreateBinary();
@@ -434,7 +466,8 @@ void loop() {
     float current_angle = scan_angles[angle_index];
     
     // 1. Acquire Data (Takes ~30ms total)
-    fireBeamAndAverage(1, current_angle); 
+    // Change num_shots from 1 to 3 (or 4) to let the PRI jitter destroy ghosts
+    fireBeamAndAverage(3, current_angle); 
     
     // 2. Wait for Core 0 to finish processing the previous angle's data
     xSemaphoreTake(dsp_done_sem, portMAX_DELAY);
