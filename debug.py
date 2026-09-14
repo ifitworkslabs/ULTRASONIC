@@ -1,6 +1,5 @@
 import serial
 import numpy as np
-from scipy.signal import hilbert
 import struct
 import multiprocessing
 import queue
@@ -24,11 +23,6 @@ MIC_POSITIONS = np.array([-0.025, -0.013, -0.002, 0.009, 0.025])
 
 THETA_DEGREES = np.arange(-90, 91, 1)
 THETA_RADIANS = np.radians(THETA_DEGREES)
-
-STEERING_VECTORS = np.zeros((NUM_CHANNELS, len(THETA_RADIANS)), dtype=complex)
-for i, theta in enumerate(THETA_RADIANS):
-    spatial_phases = (MIC_POSITIONS / WAVELENGTH) * np.sin(theta)
-    STEERING_VECTORS[:, i] = np.exp(-1j * 2 * np.pi * spatial_phases)
 
 # TUNE THESE TO YOUR ROOM'S ACOUSTICS
 STC_START_GAIN = 1.0
@@ -90,7 +84,7 @@ def serial_worker(port, baud, data_queue):
 if __name__ == '__main__':
     print("==================================================")
     print("Professor's Target Tracking Engine Online (2 MHz).")
-    print(">>> INSTANT VISUAL THRESHOLD PIN-LOCK ACTIVE <<<")
+    print(">>> MINIMALIST TELEMETRY UI ACTIVE <<<")
     print("==================================================\n")
     data_queue = multiprocessing.Queue(maxsize=100) 
     
@@ -101,96 +95,73 @@ if __name__ == '__main__':
     )
     worker_process.start()
 
-    pg.setConfigOptions(antialias=True)
+    # 1. GLOBAL TYPOGRAPHY & COLORS
+    pg.setConfigOptions(antialias=True, foreground='#8C92AC')
     app = pg.mkQApp("Radar Engine")
-    win = pg.GraphicsLayoutWidget(show=True, title="Phased Array 2D Command Center")
+    win = pg.GraphicsLayoutWidget(show=True, title="Aero-Acoustic Command Center")
     win.resize(1400, 900)
-    win.setBackground('#111111')
+    win.setBackground('#0B0D14') # Deep matte slate
     
     # --- ENVIRONMENT INFO ---
     title_label = win.addLabel(
-        f"Environment Calibration | Temp: {CALIB_TEMP} °C | Hum: {CALIB_HUM} % | SoS: {SPEED_OF_SOUND:.2f} m/s",
-        row=0, col=0, colspan=2, size='14pt', color='#00FF00'
+        f"SCANNING MODE // Temp: {CALIB_TEMP}°C | Hum: {CALIB_HUM}% | SoS: {SPEED_OF_SOUND:.2f} m/s",
+        row=0, col=0, colspan=2, size='12pt', color='#545E75', bold=True
     )
 
-    # --- LEFT COLUMN ---
-    p_music = win.addPlot(row=1, col=0, title="MUSIC (Spatial Spectrum)")
-    p_music.showGrid(x=True, y=True, alpha=0.3)
+    # --- LEFT COLUMN: SPATIAL SPECTRUM ---
+    p_music = win.addPlot(row=1, col=0, title="SPATIAL SPECTRUM")
+    p_music.showGrid(x=True, y=True, alpha=0.1) # Barely visible grid
     p_music.setXRange(-90, 90)
     p_music.setYRange(0, 1.05)
-    curve_music = p_music.plot(pen=pg.mkPen('g', width=2))
-    scatter_music = pg.ScatterPlotItem(size=12, pen=pg.mkPen('w'), brush=pg.mkBrush('r'))
+    p_music.hideAxis('right')
+    p_music.hideAxis('top')
+    
+    # The pure cyan data line
+    curve_music = p_music.plot(pen=pg.mkPen('#00E5FF', width=1.5)) 
+    scatter_music = pg.ScatterPlotItem(size=10, pen=pg.mkPen('#FFFFFF', width=2), brush=pg.mkBrush('#00E5FF'))
     p_music.addItem(scatter_music)
-    beam_indicator_music = pg.InfiniteLine(angle=90, pen=pg.mkPen((0, 100, 255, 150), width=40))
+    
+    # Faint sweeping beam indicator
+    beam_indicator_music = pg.InfiniteLine(angle=90, pen=pg.mkPen((0, 229, 255, 20), width=40))
     p_music.addItem(beam_indicator_music)
     
-    # 1. THE VISUAL THRESHOLD LINE
+    # Subtle threshold line
     VISUAL_THRESHOLD = 0.6
-    thresh_line = pg.InfiniteLine(angle=0, pos=VISUAL_THRESHOLD, pen=pg.mkPen('y', width=2, style=QtCore.Qt.DashLine))
+    thresh_line = pg.InfiniteLine(angle=0, pos=VISUAL_THRESHOLD, pen=pg.mkPen('#2A3143', width=2, style=QtCore.Qt.DashLine))
     p_music.addItem(thresh_line)
 
-    p_raw = win.addPlot(row=2, col=0, title="RAW ADC WAVEFORMS")
-    p_raw.showGrid(x=True, y=True, alpha=0.3)
-    p_raw.setYRange(-0.1, 0.1)
-    channel_colors = [(0, 255, 255), (255, 0, 255), (255, 255, 0), (255, 0, 0), (0, 255, 0)]
-    curves_raw = [p_raw.plot(pen=pg.mkPen(color, width=1.5, alpha=200)) for color in channel_colors]
-
-    # --- RIGHT COLUMN ---
-    p_radar = win.addPlot(row=1, col=1, rowspan=2, title="2D TACTICAL MAP")
+    # --- RIGHT COLUMN: TACTICAL MAP ---
+    p_radar = win.addPlot(row=1, col=1, title="2D TACTICAL MAP")
     p_radar.setAspectLocked(True) 
-    p_radar.showGrid(x=True, y=True, alpha=0.3)
+    p_radar.showGrid(x=False, y=False) # Turn off square grids!
     p_radar.setXRange(-MAX_RADAR_RANGE, MAX_RADAR_RANGE)
     p_radar.setYRange(0, MAX_RADAR_RANGE)
     p_radar.setLabel('bottom', 'Lateral Distance (m)')
     p_radar.setLabel('left', 'Forward Distance (m)')
+    p_radar.hideAxis('right')
+    p_radar.hideAxis('top')
     
+    # 2. THE MINIMALIST RADAR RINGS
     theta_ring = np.linspace(0, 2 * np.pi, 100)
     for r in [0.5, 1.0, 1.5, 2.0]:
         x_ring = r * np.sin(theta_ring)
         y_ring = r * np.cos(theta_ring)
-        p_radar.plot(x_ring, y_ring, pen=pg.mkPen((255, 255, 255, 75), width=1, style=QtCore.Qt.DashLine))
+        p_radar.plot(x_ring, y_ring, pen=pg.mkPen('#1C2233', width=1.5)) # Clean slate rings
 
-    curve_radar = p_radar.plot(pen=pg.mkPen('g', width=3))
-    scatter_radar = pg.ScatterPlotItem(size=16, pen=pg.mkPen('w'), brush=pg.mkBrush('r'))
+    curve_radar = p_radar.plot(pen=pg.mkPen((0, 229, 255, 100), width=2))
+    
+    # The Verified Target (Bright white core, electric cyan border)
+    scatter_radar = pg.ScatterPlotItem(size=12, pen=pg.mkPen('#FFFFFF', width=2), brush=pg.mkBrush('#00E5FF'))
     p_radar.addItem(scatter_radar)
     
-    beam_cone_radar = p_radar.plot(pen=pg.mkPen((0, 100, 255, 100), width=2))
-    
-    # 2. THE TACTICAL PIN (Crosshair)
-    target_pin = p_radar.plot(pen=pg.mkPen('r', width=3))
-    pin_size = 0.15
-    
-    # 3. COVERAGE TRACE (Breadcrumbs)
-    scatter_trace = pg.ScatterPlotItem(size=6, pen=pg.mkPen(None), brush=pg.mkBrush(255, 255, 0, 100))
-    p_radar.addItem(scatter_trace)
-    trace_memory = []
-    
-    # 4. PAUSE BUTTON
-    trace_active = True
-    pause_btn = QtWidgets.QPushButton("PAUSE / RESUME TRACE")
-    pause_btn.setStyleSheet("font-size: 14px; font-weight: bold; background-color: #333; color: yellow; padding: 8px;")
-    
-    def toggle_trace():
-        global trace_active
-        trace_active = not trace_active
-        if trace_active:
-            pause_btn.setStyleSheet("font-size: 14px; font-weight: bold; background-color: #333; color: yellow; padding: 8px;")
-        else:
-            pause_btn.setStyleSheet("font-size: 14px; font-weight: bold; background-color: #500; color: red; padding: 8px;")
-            
-    pause_btn.clicked.connect(toggle_trace)
-    proxy = QtWidgets.QGraphicsProxyWidget()
-    proxy.setWidget(pause_btn)
-    
-    # Add to a new row at the bottom of the right column
-    btn_layout = win.addLayout(row=3, col=1)
-    btn_layout.addItem(proxy)
+    # Ultra-faint beam cone
+    beam_cone_radar = p_radar.plot(pen=pg.mkPen((0, 229, 255, 40), width=1, style=QtCore.Qt.DashLine))
     
     active_targets = []
     target_text_items = []
 
     def update():
-        global SPEED_OF_SOUND, active_targets, trace_memory, trace_active
+        global SPEED_OF_SOUND, active_targets
         while not data_queue.empty():
             try:
                 current_scan_angle, temp, hum, target_range, target_x, target_y, confidence, raw_energy = data_queue.get_nowait()
@@ -260,16 +231,13 @@ if __name__ == '__main__':
             # --- RENDER GRAPHICS ---
             beam_indicator_music.setValue(current_scan_angle)
 
-            # We can't plot raw waveforms anymore, just clear them
-            for i in range(NUM_CHANNELS):
-                curves_raw[i].setData([], [])
-
             # We can't plot the full spectrum anymore, just show a peak in the cone
             spectrum = np.ones(len(THETA_RADIANS)) * 0.0001
             if confidence > VISUAL_THRESHOLD:
                 if target_range > 0:
                     lock_angle = np.degrees(np.arctan2(target_x, target_y))
-                    peak_idx = np.argmin(np.abs(THETA_DEGREES - lock_angle))
+                    peak_idx = int(round(lock_angle)) + 90
+                    peak_idx = max(0, min(180, peak_idx)) # Safety clamp
                     spectrum[peak_idx] = confidence
                 
             curve_music.setData(THETA_DEGREES, spectrum)
@@ -283,11 +251,10 @@ if __name__ == '__main__':
             beam_cone_radar.setData(cone_x, cone_y)
 
             music_pts, radar_pts = [], []
-            pin_x, pin_y = [], [] 
             
             # Make sure we have enough text items
             while len(target_text_items) < len(active_targets):
-                t = pg.TextItem(text="", color=(255, 0, 0), anchor=(0.5, -0.5))
+                t = pg.TextItem(text="", color='#00E5FF', anchor=(0.5, -0.5))
                 p_radar.addItem(t)
                 target_text_items.append(t)
                 
@@ -303,40 +270,15 @@ if __name__ == '__main__':
                 tx, ty = data['tx'], data['ty']
                 radar_pts.append({'pos': (tx, ty)})
                 
-                # --- Trace Breadcrumbs (Paint the Oval) ---
-                if trace_active:
-                    add_trace = True
-                    if len(trace_memory) > 0:
-                        last_tx, last_ty = trace_memory[-1]['pos']
-                        if np.hypot(last_tx - tx, last_ty - ty) < 0.05:
-                            add_trace = False # Only drop a crumb if moved 5cm
-                    
-                    if add_trace:
-                        trace_memory.append({'pos': (tx, ty)})
-                        if len(trace_memory) > 1000: # Cap at 1000 dots
-                            trace_memory.pop(0)
+
                 
                 target_text_items[i].setText(f"{data['range']:.2f}m\nPeak: {data['peak']:.2f}\nRaw: {data.get('raw', 0):.2f}")
                 target_text_items[i].setPos(tx, ty)
                 
-                # BUILD THE TACTICAL PIN CROSSHAIR
-                pin_x.extend([
-                    tx - pin_size, tx + pin_size, np.nan,
-                    tx, tx, np.nan,
-                    tx - pin_size, tx - pin_size, tx + pin_size, tx + pin_size, tx - pin_size, np.nan
-                ])
-                pin_y.extend([
-                    ty, ty, np.nan,
-                    ty - pin_size, ty + pin_size, np.nan,
-                    ty - pin_size, ty + pin_size, ty + pin_size, ty - pin_size, ty - pin_size, np.nan
-                ])
+
 
             scatter_music.setData(music_pts)
             scatter_radar.setData(radar_pts)
-            scatter_trace.setData(trace_memory)
-            
-            # DRAW THE PIN ON THE MAP
-            target_pin.setData(pin_x, pin_y)
 
     timer = QtCore.QTimer()
     timer.timeout.connect(update)

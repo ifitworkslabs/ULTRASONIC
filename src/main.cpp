@@ -17,6 +17,9 @@ float current_hum = 70.84;
 // ==============================================================================
 // I. THE GOLDEN CALIBRATION KEYS (Locked at 2 MHz)
 // ==============================================================================
+// Maps hardware ADC channel directly to our array index. -1 means ignore.
+const int HARDWARE_CH_MAP[8] = {4, -1, -1, 3, 1, 0, -1, 2}; 
+
 const int TX_TRIG[5] = {4, 14, 17, 19, 25};
 const int TX_ECHO[5] = {13, 16, 18, 23, 26};
 
@@ -85,12 +88,8 @@ void recordAcousticEchoes() {
     for (int i = 0; i < DMA_FLAT_BUFFER_SIZE; i += SOC_ADC_DIGI_RESULT_BYTES) {
         adc_digi_output_data_t *p = (adc_digi_output_data_t*)&dma_flat_buffer[i];
         
-        int ch = -1;
-        if (p->type1.channel == ADC_CHANNEL_5) ch = 0;      
-        else if (p->type1.channel == ADC_CHANNEL_4) ch = 1; 
-        else if (p->type1.channel == ADC_CHANNEL_7) ch = 2; 
-        else if (p->type1.channel == ADC_CHANNEL_3) ch = 3; 
-        else if (p->type1.channel == ADC_CHANNEL_0) ch = 4; 
+        int raw_ch = p->type1.channel;
+        int ch = (raw_ch < 8) ? HARDWARE_CH_MAP[raw_ch] : -1;
 
         if (ch != -1) {
             if (rx_indices[ch] >= CAPTURE_OFFSET && rx_indices[ch] < CAPTURE_OFFSET + WINDOW_SIZE) {
@@ -175,12 +174,6 @@ void fireBeamAndAverage(int num_shots, float target_angle) {
         int jitter = 15 + (rand() % 15); // Random delay between 15ms and 30ms
         delay(jitter); 
     }
-    
-    for(int i = 0; i < 5; i++) {
-        for(int j = 0; j < WINDOW_SIZE; j++) {
-            accumulation_buffers[i][j] /= num_shots;
-        }
-    }
 }
 
 // ==============================================================================
@@ -229,7 +222,7 @@ void dspTask(void *pvParameters) {
             for (int j = start_idx; j < end_idx; j++) {
                 int original_idx = j + CALIB_RX_HW_SHIFT[ch];
                 if (original_idx >= 0 && original_idx < WINDOW_SIZE) {
-                    sum += (float)processing_buffers[ch][original_idx] / 4095.0f;
+                    sum += (float)processing_buffers[ch][original_idx] / 12285.0f;
                     count++;
                 }
             }
@@ -239,7 +232,7 @@ void dspTask(void *pvParameters) {
             for (int j = start_idx; j < end_idx; j++) {
                 int original_idx = j + CALIB_RX_HW_SHIFT[ch];
                 if (original_idx >= 0 && original_idx < WINDOW_SIZE) {
-                    float val = ((float)processing_buffers[ch][original_idx] / 4095.0f) - channel_bias[ch];
+                    float val = ((float)processing_buffers[ch][original_idx] / 12285.0f) - channel_bias[ch];
                     var += val * val;
                 }
             }
@@ -262,31 +255,20 @@ void dspTask(void *pvParameters) {
             int peak_time_idx = 0;
 
             // --- PASS 1: Find the Peak (Time of Flight) ---
+            // GENIUS FIX: Only listen to the center microphone (Channel 2) to find the time peak.
             for (int j = start_idx + delay_idx + 1; j < end_idx; j += 4) {
-                float inst_env_sq = 0;
-                for (int ch = 0; ch < 5; ch++) {
-                    int orig_j = j + CALIB_RX_HW_SHIFT[ch];
-                    float real_part = 0, imag_part = 0;
-                    if(orig_j >= 0 && orig_j < WINDOW_SIZE) {
-                        real_part = ((float)processing_buffers[ch][orig_j] / 4095.0f) - channel_bias[ch];
-                    }
-                    // EXACT 2.5 SAMPLE INTERPOLATION FOR 90-DEGREE I/Q SHIFT AT 400kHz
-                    int d2 = (j - 2) + CALIB_RX_HW_SHIFT[ch];
-                    int d3 = (j - 3) + CALIB_RX_HW_SHIFT[ch];
-                    if (d2 >= 0 && d2 < WINDOW_SIZE && d3 >= 0 && d3 < WINDOW_SIZE) {
-                        float v2 = ((float)processing_buffers[ch][d2] / 4095.0f) - channel_bias[ch];
-                        float v3 = ((float)processing_buffers[ch][d3] / 4095.0f) - channel_bias[ch];
-                        imag_part = (v2 + v3) / 2.0f; 
-                    } else {
-                        imag_part = 0.0f;
-                    }
-                    inst_env_sq += (real_part*real_part + imag_part*imag_part);
-                }
-                
-                float min_time = (0.15f * 2.0f) / speed_of_sound;
-                int min_idx = (int)((min_time - 0.0008f) * 400000.0f - CAPTURE_OFFSET);
-                if (j > min_idx) {
-                    if (inst_env_sq > max_env_sq) {
+                int orig_j = j + CALIB_RX_HW_SHIFT[2]; // Only look at Channel 2
+                if (orig_j >= 0 && orig_j < WINDOW_SIZE) {
+                    
+                    // Skip I/Q demodulation. Just find the raw squared amplitude of the real signal
+                    // Note: Make sure to use the 12285.0f fix we discussed earlier!
+                    float val = ((float)processing_buffers[2][orig_j] / 12285.0f) - channel_bias[2];
+                    float inst_env_sq = val * val; 
+                    
+                    float min_time = (0.15f * 2.0f) / speed_of_sound;
+                    int min_idx = (int)((min_time - 0.0008f) * 400000.0f - CAPTURE_OFFSET);
+                    
+                    if (j > min_idx && inst_env_sq > max_env_sq) {
                         max_env_sq = inst_env_sq;
                         peak_time_idx = j;
                     }
@@ -301,32 +283,31 @@ void dspTask(void *pvParameters) {
             int rxx_end = min((int)end_idx, peak_time_idx + window_half_width);
             
             for (int j = rxx_start; j < rxx_end; j++) {
-                float normalized_time = (float)(j) / (float)WINDOW_SIZE;
-                float stc = stc_start + (stc_end - stc_start) * (normalized_time * normalized_time);
+                // GENIUS FIX: STC mathematically deleted. Eigenvectors are scale-invariant!
                 
                 Vector5cf X;
                 for (int ch = 0; ch < 5; ch++) {
                     int orig_j = j + CALIB_RX_HW_SHIFT[ch];
                     float real_part = 0, imag_part = 0;
                     if(orig_j >= 0 && orig_j < WINDOW_SIZE) {
-                        real_part = ((float)processing_buffers[ch][orig_j] / 4095.0f) - channel_bias[ch];
+                        real_part = ((float)processing_buffers[ch][orig_j] / 12285.0f) - channel_bias[ch];
                     }
                     // EXACT 2.5 SAMPLE INTERPOLATION FOR 90-DEGREE I/Q SHIFT AT 400kHz
                     int d2 = (j - 2) + CALIB_RX_HW_SHIFT[ch];
                     int d3 = (j - 3) + CALIB_RX_HW_SHIFT[ch];
                     if (d2 >= 0 && d2 < WINDOW_SIZE && d3 >= 0 && d3 < WINDOW_SIZE) {
-                        float v2 = ((float)processing_buffers[ch][d2] / 4095.0f) - channel_bias[ch];
-                        float v3 = ((float)processing_buffers[ch][d3] / 4095.0f) - channel_bias[ch];
-                        imag_part = (v2 + v3) / 2.0f; 
+                        // Combine integers first (instantaneous), divide ONCE, subtract bias ONCE.
+                        float raw_sum = (float)(processing_buffers[ch][d2] + processing_buffers[ch][d3]);
+                        imag_part = (raw_sum / 24570.0f) - channel_bias[ch]; 
                     } else {
                         imag_part = 0.0f;
                     }
                     
-                    real_part *= stc;
-                    imag_part *= stc;
+
                     X(ch) = std::complex<float>(real_part, imag_part);
                 }
-                Rxx += (X * X.adjoint());
+                // Rank Update strictly calculates ONLY the lower triangular half of the matrix!
+                Rxx.selfadjointView<Eigen::Lower>().rankUpdate(X, 1.0f);
                 rxx_count++;
             }
             if (rxx_count > 0) {
@@ -341,7 +322,8 @@ void dspTask(void *pvParameters) {
             Eigen::SelfAdjointEigenSolver<Matrix5cf> eigensolver(Rxx);
             Matrix5cf eigenvectors = eigensolver.eigenvectors(); 
             Eigen::Matrix<std::complex<float>, 5, 4> noise_subspace = eigenvectors.leftCols<4>();
-            Matrix5cf P_noise = noise_subspace * noise_subspace.adjoint();
+            // Matrix5cf P_noise = noise_subspace * noise_subspace.adjoint(); 
+            Eigen::Matrix<std::complex<float>, 4, 5> Un_H = noise_subspace.adjoint();
             
             float mic_positions[5] = {-0.025f, -0.013f, -0.002f, 0.009f, 0.025f};
             float wavelength = speed_of_sound / 40000.0f;
@@ -354,17 +336,33 @@ void dspTask(void *pvParameters) {
             const float TX_SIGMA = 12.0f; 
             
             // 1. Search the ENTIRE room
+            float k_constant = 2.0f * M_PI / wavelength;
+            
+            // Create a static look-up table (LUT) that persists in memory
+            static float sin_lut[181];
+            static bool lut_init = false;
+            if (!lut_init) {
+                for (int i = 0; i <= 180; i++) {
+                    sin_lut[i] = sinf((i - 90) * (M_PI / 180.0f));
+                }
+                lut_init = true;
+            }
+
             for (int theta = -90; theta <= 90; theta++) {
-                float theta_rad = theta * (M_PI / 180.0f);
+                // Just grab the pre-calculated answer from the array!
+                float k_x = k_constant * sin_lut[theta + 90]; 
+                
                 Vector5cf a;
                 for (int ch = 0; ch < 5; ch++) {
-                    float phase = (2.0f * M_PI / wavelength) * mic_positions[ch] * sinf(theta_rad);
+                    // A single bare multiplication. No redundant sines!
+                    float phase = k_x * mic_positions[ch]; 
                     a(ch) = std::complex<float>(cosf(phase), -sinf(phase));
                 }
-                std::complex<float> denom = a.adjoint() * P_noise * a;
-                
                 // --- RX GAIN (The raw MUSIC spatial spectrum) ---
-                float p_music = 1.0f / abs(denom); 
+                Eigen::Vector<std::complex<float>, 4> projection = Un_H * a;
+                float denom = projection.squaredNorm();
+                
+                float p_music = 1.0f / denom; 
                 
                 // Track the absolute loudest echo in the room (used for the final Python score)
                 if (p_music > global_music_max) {
