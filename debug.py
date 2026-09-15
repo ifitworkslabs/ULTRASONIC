@@ -47,6 +47,8 @@ TARGET_TTL_PINGS = 40  # 5 pings = 1 full frame/sweep. 10 pings = lingers for 2 
 # ==========================================
 # II. CORE 1: THE DEDICATED SERIAL WORKER
 # ==========================================
+PAYLOAD_STRUCT = struct.Struct('<8f')
+
 def serial_worker(port, baud, data_queue):
     try:
         ser = serial.Serial(port, baud, timeout=2)
@@ -60,22 +62,13 @@ def serial_worker(port, baud, data_queue):
             if ser.in_waiting > 1000:
                 ser.reset_input_buffer()
             
-            sync_buffer = b''
-            while True:
-                byte = ser.read(1)
-                if not byte: break
-                sync_buffer += byte
-                if len(sync_buffer) == 4:
-                    if sync_buffer == b'\xaa\xbb\xcc\xdd':
-                        break
-                    else:
-                        sync_buffer = sync_buffer[1:]
-                        
-            if len(sync_buffer) < 4: continue 
+            sync_buffer = ser.read_until(b'\xaa\xbb\xcc\xdd')
+            if not sync_buffer.endswith(b'\xaa\xbb\xcc\xdd'):
+                continue
 
             payload_bytes = ser.read(32)
             if len(payload_bytes) < 32: continue
-            scan_angle, temp, hum, target_range, target_x, target_y, confidence, pad = struct.unpack('<ffffffff', payload_bytes)
+            scan_angle, temp, hum, target_range, target_x, target_y, confidence, pad = PAYLOAD_STRUCT.unpack(payload_bytes)
             
             data_queue.put((scan_angle, temp, hum, target_range, target_x, target_y, confidence, pad))
             
@@ -131,7 +124,7 @@ if __name__ == '__main__':
     p_music.addItem(beam_indicator_music)
     
     # Subtle threshold line
-    VISUAL_THRESHOLD = 0.7
+    VISUAL_THRESHOLD = 0.85
     thresh_line = pg.InfiniteLine(angle=0, pos=VISUAL_THRESHOLD, pen=pg.mkPen('#2A3143', width=2, style=QtCore.Qt.DashLine))
     p_music.addItem(thresh_line)
 
@@ -301,7 +294,7 @@ if __name__ == '__main__':
             elif abs_deg > 10:
                 req_hits = 5   # Mid angles (+/- 20) need some verification
             else:
-                req_hits = 3   # Center angle (0) is trusted instantly
+                req_hits = 5   # Center angle (0) is trusted instantly
             
             # If it hasn't been seen enough times, keep it invisible in the background
             if data['hits'] < req_hits: 
@@ -319,6 +312,6 @@ if __name__ == '__main__':
 
     timer = QtCore.QTimer()
     timer.timeout.connect(update)
-    timer.start(0) 
+    timer.start(16) 
 
     pg.exec()

@@ -46,7 +46,8 @@ TaskHandle_t dspTaskHandle;
 
 adc_continuous_handle_t adc_handle = NULL;
 const uint32_t DMA_FLAT_BUFFER_SIZE = 48000; 
-uint8_t dma_flat_buffer[DMA_FLAT_BUFFER_SIZE] = {0};
+uint8_t* dma_flat_buffer = nullptr;
+uint32_t PRECOMPUTED_TRANSITIONS[5][5][16];
 
 const adc_channel_t RX_CHANNELS[5] = {ADC_CHANNEL_5, ADC_CHANNEL_4, ADC_CHANNEL_7, ADC_CHANNEL_3, ADC_CHANNEL_0};
 
@@ -104,30 +105,33 @@ void recordAcousticEchoes() {
 // ==============================================================================
 // III. CONTINUOUS FIRING ENGINE
 // ==============================================================================
-void IRAM_ATTR fireSteeredBeam(float angle_degrees) {
+void precomputeBeamPatterns() {
+    float scan_angles[5] = {-40.0f, 20.0f, -20.0f, 40.0f, 0.0f};
     uint32_t half_period = 3000; 
     uint32_t full_period = 6000; 
-    uint32_t transitions[5][16];
     
-    float angle_rad = angle_degrees * (M_PI / 180.0);
-    int tick_step = round(3000.0 * sin(angle_rad));
-
-    int min_tick = 0;
-    for(int i = 0; i < 5; i++) {
-        int raw_delay = CALIB_TX_HW_TICKS[i] + (i * tick_step);
-        if(raw_delay < min_tick) {
-            min_tick = raw_delay;
+    for (int a = 0; a < 5; a++) {
+        float angle_rad = scan_angles[a] * ((float)M_PI / 180.0f);
+        // Using hardware float 'roundf' and 'sinf'
+        int tick_step = roundf(3000.0f * sinf(angle_rad)); 
+        
+        int min_tick = 0;
+        for(int i = 0; i < 5; i++) {
+            int raw_delay = CALIB_TX_HW_TICKS[i] + (i * tick_step);
+            if(raw_delay < min_tick) min_tick = raw_delay;
+        }
+        
+        for(int i = 0; i < 5; i++) {
+            int final_delay = CALIB_TX_HW_TICKS[i] + (i * tick_step) - min_tick;
+            for(int p = 0; p < 8; p++) {
+                PRECOMPUTED_TRANSITIONS[a][i][p*2]     = final_delay + (p * full_period);               
+                PRECOMPUTED_TRANSITIONS[a][i][p*2 + 1] = final_delay + (p * full_period) + half_period; 
+            }
         }
     }
-    
-    for(int i = 0; i < 5; i++) {
-        int final_delay = CALIB_TX_HW_TICKS[i] + (i * tick_step) - min_tick;
-        for(int p = 0; p < 8; p++) {
-            transitions[i][p*2]     = final_delay + (p * full_period);               
-            transitions[i][p*2 + 1] = final_delay + (p * full_period) + half_period; 
-        }
-    }
+}
 
+void IRAM_ATTR fireSteeredBeam(int angle_idx) {
     uint8_t state_index[5] = {0, 0, 0, 0, 0};
     bool active = true;
 
@@ -140,7 +144,8 @@ void IRAM_ATTR fireSteeredBeam(float angle_degrees) {
         for(int i = 0; i < 5; i++) {
             if(state_index[i] < 16) {
                 active = true; 
-                if(current_time >= transitions[i][state_index[i]]) {
+                // Directly reading from the pre-computed 3D array array! O(1) time complexity.
+                if(current_time >= PRECOMPUTED_TRANSITIONS[angle_idx][i][state_index[i]]) {
                     if(state_index[i] % 2 == 0) {
                         REG_WRITE(GPIO_OUT_W1TS_REG, (1 << TX_TRIG[i]));
                         REG_WRITE(GPIO_OUT_W1TC_REG, (1 << TX_ECHO[i]));
@@ -162,11 +167,11 @@ void IRAM_ATTR fireSteeredBeam(float angle_degrees) {
     portENABLE_INTERRUPTS();
 }
 
-void fireBeamAndAverage(int num_shots, float target_angle) {
+void fireBeamAndAverage(int num_shots, int angle_idx) {
     memset(accumulation_buffers, 0, sizeof(accumulation_buffers));
     
     for(int shot = 0; shot < num_shots; shot++) {
-        fireSteeredBeam(target_angle); 
+        fireSteeredBeam(angle_idx); 
         recordAcousticEchoes();
         // Jitter the Pulse Repetition Interval (PRI) to randomize the time-of-flight of multi-path
         // echoes. This causes ghost reflections to jump wildly in distance, allowing the UI's
@@ -194,6 +199,21 @@ struct TargetDataPayload {
 #pragma pack(pop)
 
 void dspTask(void *pvParameters) {
+    typedef Eigen::Matrix<std::complex<float>, 5, 5> Matrix5cf;
+    typedef Eigen::Matrix<std::complex<float>, 5, 1> Vector5cf;
+    
+    Matrix5cf Rxx;
+    Matrix5cf J = Matrix5cf::Zero();
+    for (int i = 0; i < 5; i++) J(i, 4 - i) = std::complex<float>(1.0f, 0.0f);
+    
+    Vector5cf X;
+    Vector5cf a;
+    Eigen::SelfAdjointEigenSolver<Matrix5cf> eigensolver;
+    Matrix5cf eigenvectors;
+    Eigen::Matrix<std::complex<float>, 5, 4> noise_subspace;
+    Eigen::Matrix<std::complex<float>, 4, 5> Un_H;
+    Eigen::Vector<std::complex<float>, 4> projection;
+
     while(1) {
         // Wait until Core 1 gives us new data
         xSemaphoreTake(dsp_ready_sem, portMAX_DELAY);
@@ -242,11 +262,8 @@ void dspTask(void *pvParameters) {
         float signal_energy = var_sum / 5.0f;
         float noise_floor_threshold = 0.000001f; // Reject absolute silence
         
-        typedef Eigen::Matrix<std::complex<float>, 5, 5> Matrix5cf;
-        typedef Eigen::Matrix<std::complex<float>, 5, 1> Vector5cf;
-        
         if (signal_energy > noise_floor_threshold) {
-            Matrix5cf Rxx = Matrix5cf::Zero();
+            Rxx.setZero();
             
             float stc_start = 1.0f;
             float stc_end = 5.0f; 
@@ -291,7 +308,6 @@ void dspTask(void *pvParameters) {
             }
             
             for (int j = rxx_start; j < rxx_end; j++) {
-                Vector5cf X;
                 for (int ch = 0; ch < 5; ch++) {
                     int orig_j = j + CALIB_RX_HW_SHIFT[ch];
                     float real_part = 0, imag_part = 0;
@@ -326,8 +342,6 @@ void dspTask(void *pvParameters) {
             Rxx.triangularView<Eigen::Upper>() = Rxx.adjoint();
 
             // Forward-Backward Spatial Smoothing (FBSS)
-            Matrix5cf J = Matrix5cf::Zero();
-            for (int i = 0; i < 5; i++) J(i, 4 - i) = std::complex<float>(1.0f, 0.0f);
             Rxx = 0.5f * (Rxx + J * Rxx.conjugate() * J);
             
             // Diagonal Loading: inject artificial noise to prevent matrix singularity
@@ -335,11 +349,10 @@ void dspTask(void *pvParameters) {
                 Rxx(i, i) += std::complex<float>(0.00005f, 0.0f);
             }
             
-            Eigen::SelfAdjointEigenSolver<Matrix5cf> eigensolver(Rxx);
-            Matrix5cf eigenvectors = eigensolver.eigenvectors(); 
-            Eigen::Matrix<std::complex<float>, 5, 4> noise_subspace = eigenvectors.leftCols<4>();
-            // Matrix5cf P_noise = noise_subspace * noise_subspace.adjoint(); 
-            Eigen::Matrix<std::complex<float>, 4, 5> Un_H = noise_subspace.adjoint();
+            eigensolver.compute(Rxx);
+            eigenvectors = eigensolver.eigenvectors(); 
+            noise_subspace = eigenvectors.leftCols<4>();
+            Un_H = noise_subspace.adjoint();
             
             float mic_positions[5] = {-0.025f, -0.013f, -0.002f, 0.009f, 0.025f};
             float wavelength = speed_of_sound / 40000.0f;
@@ -349,17 +362,18 @@ void dspTask(void *pvParameters) {
             int best_angle = 0;
             
             // Standard deviation of 12.0 creates a much wider, forgiving beam
-            const float TX_SIGMA = 12.0f; 
+            const float TX_SIGMA = 8.0f; 
             
             // 1. Search the ENTIRE room
             
             // Create a static look-up table (LUT) that persists in memory
             static std::complex<float> steer_lut[181][5];
             static float last_speed_of_sound = 0.0f;
-            if (fabs(speed_of_sound - last_speed_of_sound) > 0.1f) {
-                float k_constant = 2.0f * M_PI / wavelength;
+            // Use fabsf instead of fabs for float!
+            if (fabsf(speed_of_sound - last_speed_of_sound) > 0.1f) {
+                float k_constant = 2.0f * (float)M_PI / wavelength;
                 for (int i = 0; i <= 180; i++) {
-                    float theta_rad = (i - 90) * (M_PI / 180.0f);
+                    float theta_rad = (i - 90) * ((float)M_PI / 180.0f);
                     float k_x = k_constant * sinf(theta_rad);
                     for (int ch = 0; ch < 5; ch++) {
                         float phase = k_x * mic_positions[ch];
@@ -369,16 +383,24 @@ void dspTask(void *pvParameters) {
                 last_speed_of_sound = speed_of_sound;
             }
 
+            // Get a raw C-pointer to the noise subspace data array. 
+            // Eigen stores matrices in "Column-Major" order by default!
+            const std::complex<float>* Un_ptr = Un_H.data(); 
+
             for (int theta = -90; theta <= 90; theta++) {
                 
-                Vector5cf a;
-                for (int ch = 0; ch < 5; ch++) {
-                    // Fast lookup, ZERO trigonometry!
-                    a(ch) = steer_lut[theta + 90][ch];
+                float denom = 0.0f;
+                
+                // Manual Matrix-Vector Multiplication (Un_H * a)
+                for (int row = 0; row < 4; row++) {
+                    std::complex<float> sum(0.0f, 0.0f);
+                    for (int col = 0; col < 5; col++) {
+                        // Un_ptr index logic for Column-Major: row + (col * total_rows)
+                        sum += Un_ptr[row + (col * 4)] * steer_lut[theta + 90][col];
+                    }
+                    // std::norm returns the SQUARED magnitude for complex numbers in C++! Perfect for our denom.
+                    denom += std::norm(sum); 
                 }
-                // --- RX GAIN (The raw MUSIC spatial spectrum) ---
-                Eigen::Vector<std::complex<float>, 4> projection = Un_H * a;
-                float denom = projection.squaredNorm();
                 
                 float p_music = 1.0f / denom; 
                 
@@ -407,7 +429,7 @@ void dspTask(void *pvParameters) {
             payload.confidence = (global_music_max > 0) ? (best_two_way_peak / global_music_max) : 0.0f;
             
             // 3. ALWAYS calculate and send the physical coordinates
-            float lock_angle_rad = best_angle * (M_PI / 180.0f);
+            float lock_angle_rad = best_angle * ((float)M_PI / 180.0f);
             float time_of_flight = 0.0008f + ((CAPTURE_OFFSET + peak_time_idx) / 400000.0f);
             payload.target_range = (time_of_flight * speed_of_sound) / 2.0f;
             payload.target_x = payload.target_range * sinf(lock_angle_rad);
@@ -442,7 +464,17 @@ void setup() {
         pinMode(TX_TRIG[i], OUTPUT); pinMode(TX_ECHO[i], OUTPUT);
         digitalWrite(TX_TRIG[i], LOW); digitalWrite(TX_ECHO[i], LOW);
     }
+    
+    dma_flat_buffer = (uint8_t*)heap_caps_malloc(DMA_FLAT_BUFFER_SIZE, MALLOC_CAP_DMA);
+    if (dma_flat_buffer == NULL) {
+        Serial.println("FATAL: Failed to allocate dma_flat_buffer");
+        while (1) {
+            delay(100);
+        }
+    }
     initHardwareDMA();
+    
+    precomputeBeamPatterns();
     
     // Dynamically allocate to avoid .bss overflow
     processing_buffers = (uint16_t (*)[WINDOW_SIZE]) malloc(5 * WINDOW_SIZE * sizeof(uint16_t));
@@ -483,7 +515,7 @@ void loop() {
     
     // 1. Acquire Data (Takes ~30ms total)
     // Change num_shots from 1 to 3 (or 4) to let the PRI jitter destroy ghosts
-    fireBeamAndAverage(3, current_angle); 
+    fireBeamAndAverage(3, angle_index); 
     
     // 2. Wait for Core 0 to finish processing the previous angle's data
     xSemaphoreTake(dsp_done_sem, portMAX_DELAY);
