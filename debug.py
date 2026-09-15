@@ -39,6 +39,11 @@ CROP_OFFSET = 0
 # THE DYNAMIC BLIND SPOT (Mutes the Screaming Transducer)
 MIN_RADAR_RANGE = 0.65         
 
+# TRACKING TUNING (Controls how easily new radar pings snap to existing targets)
+MERGE_RADIUS_BASE = 0.005
+MERGE_RADIUS_SCALE = 0.00
+TARGET_TTL_PINGS = 40  # 5 pings = 1 full frame/sweep. 10 pings = lingers for 2 frames when trace is lost
+
 # ==========================================
 # II. CORE 1: THE DEDICATED SERIAL WORKER
 # ==========================================
@@ -126,7 +131,7 @@ if __name__ == '__main__':
     p_music.addItem(beam_indicator_music)
     
     # Subtle threshold line
-    VISUAL_THRESHOLD = 0.6
+    VISUAL_THRESHOLD = 0.7
     thresh_line = pg.InfiniteLine(angle=0, pos=VISUAL_THRESHOLD, pen=pg.mkPen('#2A3143', width=2, style=QtCore.Qt.DashLine))
     p_music.addItem(thresh_line)
 
@@ -162,6 +167,17 @@ if __name__ == '__main__':
 
     def update():
         global SPEED_OF_SOUND, active_targets
+        
+        processed_any = False
+        current_scan_angle = 0
+        temp = 0
+        hum = 0
+        target_range = 0
+        target_x = 0
+        target_y = 0
+        confidence = 0
+        raw_energy = 0
+        
         while not data_queue.empty():
             try:
                 current_scan_angle, temp, hum, target_range, target_x, target_y, confidence, raw_energy = data_queue.get_nowait()
@@ -170,14 +186,13 @@ if __name__ == '__main__':
                 
             speed_of_sound = 331.4 + (0.606 * temp) + (0.0124 * hum)
             SPEED_OF_SOUND = speed_of_sound
-            
-            title_label.setText(f"Environment Calibration | Temp: {temp:.2f} °C | Hum: {hum:.2f} % | SoS: {SPEED_OF_SOUND:.2f} m/s")
+            processed_any = True
                 
             cone_min = current_scan_angle - 10
             cone_max = current_scan_angle + 10
             
             # =======================================================
-            # SPATIAL TARGET CLUSTERING (NMS)
+            # SPATIAL TARGET CLUSTERING & TRACKING
             # =======================================================
             # Decrease TTL for all existing targets
             for t in active_targets:
@@ -186,12 +201,12 @@ if __name__ == '__main__':
             # Remove dead targets
             active_targets = [t for t in active_targets if t['ttl'] > 0]
             
-            if confidence > VISUAL_THRESHOLD and target_range > 0:
+            if confidence > VISUAL_THRESHOLD and target_range > MIN_RADAR_RANGE:
                 lock_angle_deg = np.degrees(np.arctan2(target_x, target_y))
                 
                 # Check if this detection belongs to an existing target (Dynamic radius based on range)
                 # At 2 meters, angular error of 10 degrees is ~0.35m physically. 
-                dynamic_merge_radius = 0.2 + (0.2 * target_range)
+                dynamic_merge_radius = MERGE_RADIUS_BASE + (MERGE_RADIUS_SCALE * target_range)
                 
                 merged = False
                 for t in active_targets:
@@ -202,14 +217,21 @@ if __name__ == '__main__':
                         weight_ratio = (confidence / max(t['peak'], 0.1)) ** 2
                         alpha = 0.3 * min(weight_ratio, 1.0)
                         
-                        t['tx'] = (1.0 - alpha) * t['tx'] + alpha * target_x
-                        t['ty'] = (1.0 - alpha) * t['ty'] + alpha * target_y
-                        t['range'] = (1.0 - alpha) * t['range'] + alpha * target_range
-                        t['deg'] = (1.0 - alpha) * t['deg'] + alpha * lock_angle_deg
+                        # Measurement residual (error)
+                        res_x = target_x - t['tx']
+                        res_y = target_y - t['ty']
+                        
+                        # State Update
+                        t['tx'] += alpha * res_x
+                        t['ty'] += alpha * res_y
+                        
+                        t['range'] = np.hypot(t['tx'], t['ty'])
+                        t['deg'] = np.degrees(np.arctan2(t['tx'], t['ty']))
+                        
                         # EMA the peak confidence so it can slowly adapt down
                         t['peak'] = (0.9 * t['peak']) + (0.1 * confidence)
                         t['raw'] = (0.9 * t.get('raw', 0)) + (0.1 * raw_energy)
-                        t['ttl'] = 15 # stay alive for 3 full 5-angle sweeps
+                        t['ttl'] = TARGET_TTL_PINGS 
                         t['hits'] += 1
                         merged = True
                         break
@@ -219,7 +241,7 @@ if __name__ == '__main__':
                         'deg': lock_angle_deg,
                         'peak': confidence, 'range': target_range,
                         'tx': target_x, 'ty': target_y,
-                        'ttl': 15,
+                        'ttl': TARGET_TTL_PINGS,
                         'hits': 1,
                         'raw': raw_energy
                     })
@@ -228,57 +250,72 @@ if __name__ == '__main__':
 
             # =======================================================
 
-            # --- RENDER GRAPHICS ---
-            beam_indicator_music.setValue(current_scan_angle)
-
-            # We can't plot the full spectrum anymore, just show a peak in the cone
-            spectrum = np.ones(len(THETA_RADIANS)) * 0.0001
-            if confidence > VISUAL_THRESHOLD:
-                if target_range > 0:
-                    lock_angle = np.degrees(np.arctan2(target_x, target_y))
-                    peak_idx = int(round(lock_angle)) + 90
-                    peak_idx = max(0, min(180, peak_idx)) # Safety clamp
-                    spectrum[peak_idx] = confidence
-                
-            curve_music.setData(THETA_DEGREES, spectrum)
-
-            x_radar = spectrum * MAX_RADAR_RANGE * np.sin(THETA_RADIANS)
-            y_radar = spectrum * MAX_RADAR_RANGE * np.cos(THETA_RADIANS)
-            curve_radar.setData(x_radar, y_radar)
+        # =======================================================
+        # --- RENDER GRAPHICS (RUNS ONCE PER GUI TICK) ---
+        # =======================================================
+        if not processed_any:
+            return
             
-            cone_x = [0, MAX_RADAR_RANGE * np.sin(np.radians(cone_max)), MAX_RADAR_RANGE * np.sin(np.radians(cone_min)), 0]
-            cone_y = [0, MAX_RADAR_RANGE * np.cos(np.radians(cone_max)), MAX_RADAR_RANGE * np.cos(np.radians(cone_min)), 0]
-            beam_cone_radar.setData(cone_x, cone_y)
-
-            music_pts, radar_pts = [], []
+        title_label.setText(f"Environment Calibration | Temp: {temp:.2f} °C | Hum: {hum:.2f} % | SoS: {SPEED_OF_SOUND:.2f} m/s")
             
-            # Make sure we have enough text items
-            while len(target_text_items) < len(active_targets):
-                t = pg.TextItem(text="", color='#00E5FF', anchor=(0.5, -0.5))
-                p_radar.addItem(t)
-                target_text_items.append(t)
-                
-            # Hide all text items initially
-            for t in target_text_items:
-                t.setText("")
+        cone_min = current_scan_angle - 10
+        cone_max = current_scan_angle + 10
+        beam_indicator_music.setValue(current_scan_angle)
+
+        # We can't plot the full spectrum anymore, just show a peak in the cone
+        spectrum = np.ones(len(THETA_RADIANS)) * 0.0001
+        if confidence > VISUAL_THRESHOLD:
+            if target_range > MIN_RADAR_RANGE:
+                lock_angle = np.degrees(np.arctan2(target_x, target_y))
+                peak_idx = int(round(lock_angle)) + 90
+                peak_idx = max(0, min(180, peak_idx)) # Safety clamp
+                spectrum[peak_idx] = confidence
             
-            for i, data in enumerate(active_targets):
-                if data['hits'] < 1: # Draw it immediately! The ESP32 already verified it.
-                    continue
-                    
-                music_pts.append({'pos': (data['deg'], data['peak'])})
-                tx, ty = data['tx'], data['ty']
-                radar_pts.append({'pos': (tx, ty)})
-                
+        curve_music.setData(THETA_DEGREES, spectrum)
 
-                
-                target_text_items[i].setText(f"{data['range']:.2f}m\nPeak: {data['peak']:.2f}\nRaw: {data.get('raw', 0):.2f}")
-                target_text_items[i].setPos(tx, ty)
-                
+        x_radar = spectrum * MAX_RADAR_RANGE * np.sin(THETA_RADIANS)
+        y_radar = spectrum * MAX_RADAR_RANGE * np.cos(THETA_RADIANS)
+        curve_radar.setData(x_radar, y_radar)
+        
+        cone_x = [0, MAX_RADAR_RANGE * np.sin(np.radians(cone_max)), MAX_RADAR_RANGE * np.sin(np.radians(cone_min)), 0]
+        cone_y = [0, MAX_RADAR_RANGE * np.cos(np.radians(cone_max)), MAX_RADAR_RANGE * np.cos(np.radians(cone_min)), 0]
+        beam_cone_radar.setData(cone_x, cone_y)
 
-
-            scatter_music.setData(music_pts)
-            scatter_radar.setData(radar_pts)
+        music_pts, radar_pts = [], []
+        
+        # Make sure we have enough text items
+        while len(target_text_items) < len(active_targets):
+            t = pg.TextItem(text="", color='#00E5FF', anchor=(0.5, -0.5))
+            p_radar.addItem(t)
+            target_text_items.append(t)
+            
+        # Hide all text items initially
+        for t in target_text_items:
+            t.setText("")
+        
+        for i, data in enumerate(active_targets):
+            # Dynamic Track Initiation: Stricter at edges (ghost-prone), instant at center
+            abs_deg = abs(data['deg'])
+            if abs_deg > 30:
+                req_hits = 5   # Extreme angles (+/- 40) need heavy verification
+            elif abs_deg > 10:
+                req_hits = 5   # Mid angles (+/- 20) need some verification
+            else:
+                req_hits = 3   # Center angle (0) is trusted instantly
+            
+            # If it hasn't been seen enough times, keep it invisible in the background
+            if data['hits'] < req_hits: 
+                continue
+                
+            music_pts.append({'pos': (data['deg'], data['peak'])})
+            tx, ty = data['tx'], data['ty']
+            radar_pts.append({'pos': (tx, ty)})
+            
+            target_text_items[i].setText(f"{data['range']:.2f}m\nPeak: {data['peak']:.2f}\nRaw: {data.get('raw', 0):.2f}")
+            target_text_items[i].setPos(tx, ty)
+            
+        scatter_music.setData(music_pts)
+        scatter_radar.setData(radar_pts)
 
     timer = QtCore.QTimer()
     timer.timeout.connect(update)
